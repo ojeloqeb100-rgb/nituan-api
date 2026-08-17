@@ -5,9 +5,8 @@
 #
 # Official compose uses image: calciumion/new-api:latest (Docker Hub, not GHCR).
 # That image does not include this fork's code, so production must build from the Dockerfile.
-#
-# Second disk: edit the volumes below to your real mount. Do not guess drive letters
-# in GitHub Actions. Workflows never run `docker compose down -v`.
+# Switching image/build is safe only when the volume left-hand paths stay the same.
+# Workflows never run `docker compose down`, `down -v`, or `volume rm`.
 
 services:
   new-api:
@@ -20,22 +19,22 @@ services:
       - "127.0.0.1:3000:3000"
     environment:
       - VIDEO_CACHE_DIR=/data/video-cache
-      # Put secrets in a gitignored .env next to compose, then uncomment:
+      # Put secrets in a gitignored .env next to compose, then uncomment.
+      # Do not change SQL_DSN when switching from the official image unless it
+      # still points at the same live database.
       # - SESSION_SECRET=${SESSION_SECRET}
       # - SESSION_COOKIE_SECURE=true
       # - SESSION_COOKIE_TRUSTED_URL=${SESSION_COOKIE_TRUSTED_URL}
       # - TRUSTED_PROXIES=172.16.0.0/12
       # - SQL_DSN=${SQL_DSN}
       # - REDIS_CONN_STRING=${REDIS_CONN_STRING}
-    # Sequence fields replace the base service list; keep every mount you need.
+    # Sequence fields can replace the base list. Always keep the live data mounts.
+    # Do not change the host path on the left of ./data:/data.
     volumes:
       - ./data:/data
       - ./logs:/app/logs
-      # Bind the large disk here (replace with your mount). Either:
-      #   - /mnt/YOUR_LARGE_DISK:/data
-      #     (then remove ./data:/data so /data is not mounted twice)
-      # or keep ./data:/data for SQLite/app files and only cache videos on the large disk:
-      #   - /mnt/YOUR_LARGE_DISK/video-cache:/data/video-cache
+      # Second disk: ADD a video-cache bind only. Do not replace ./data:/data.
+      # - /mnt/YOUR_LARGE_DISK/video-cache:/data/video-cache
 
   # Uncomment together with matching values in .env (must stay in sync with SQL_DSN / REDIS_CONN_STRING):
   # postgres:

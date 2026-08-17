@@ -1,6 +1,12 @@
 # Personal-fork VPS deploy (not for QuantumNous/new-api).
-# SSH to the server, fast-forward the clone, then docker compose up -d --build.
-# Never run docker compose down -v (that would wipe named volumes and bind data).
+# Updates tracked git files, then recreates containers from a new image.
+# Bind mounts and named volumes are left in place.
+#
+# This workflow must NEVER:
+#   - git clean / git reset --hard
+#   - docker compose down  (especially not down -v)
+#   - docker volume rm
+#   - delete ./data, .env, or docker-compose.override.yml
 name: Deploy to VPS
 
 on:
@@ -30,6 +36,7 @@ jobs:
     env:
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
       DEPLOY_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref_name }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
@@ -40,10 +47,13 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           fingerprint: ${{ secrets.DEPLOY_SSH_FINGERPRINT }}
           command_timeout: 40m
-          envs: DEPLOY_PATH,DEPLOY_REF
+          envs: DEPLOY_PATH,DEPLOY_REF,GITHUB_REPOSITORY
           script: |
             set -euo pipefail
             export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:$PATH"
+
+            echo "Safe update only: fetch + checkout/ff-only of tracked files, then docker compose up -d --build."
+            echo "Will not run: git clean, git reset --hard, compose down, compose down -v, volume rm, or rm of data/."
 
             if [ -z "${DEPLOY_PATH:-}" ]; then
               echo "DEPLOY_PATH secret is empty"
@@ -60,17 +70,71 @@ jobs:
               echo "Invalid DEPLOY_REF"
               exit 1
             fi
-
-            cd "$DEPLOY_PATH"
-
-            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-              echo "Tracked files have local modifications. Put server-only config in docker-compose.override.yml and .env, then retry."
-              git status
+            if [ -z "${GITHUB_REPOSITORY:-}" ]; then
+              echo "GITHUB_REPOSITORY is empty"
               exit 1
             fi
 
+            cd "$DEPLOY_PATH"
+
+            if [ ! -d .git ] || [ ! -f docker-compose.yml ]; then
+              echo "DEPLOY_PATH must be an existing git checkout that already contains docker-compose.yml"
+              exit 1
+            fi
+
+            origin_url="$(git remote get-url origin)"
+            case "$origin_url" in
+              *"${GITHUB_REPOSITORY}"*) ;;
+              *)
+                echo "origin is not ${GITHUB_REPOSITORY}; refusing so the wrong repo is not pulled."
+                echo "origin=${origin_url}"
+                echo "On the server: git remote set-url origin https://github.com/${GITHUB_REPOSITORY}.git"
+                exit 1
+                ;;
+            esac
+
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              echo "Tracked files have local modifications. Refusing so production files are not overwritten."
+              echo "Keep server-only config in untracked docker-compose.override.yml and .env, then retry."
+              git status --untracked-files=no
+              exit 1
+            fi
+
+            had_env=0
+            had_override=0
+            had_data=0
+            [ -f .env ] && had_env=1
+            [ -f docker-compose.override.yml ] && had_override=1
+            [ -e data ] && had_data=1
+
             git fetch origin --prune --tags
-            git checkout -B "$DEPLOY_REF" "origin/$DEPLOY_REF"
+
+            if git show-ref --verify --quiet "refs/remotes/origin/${DEPLOY_REF}"; then
+              if git show-ref --verify --quiet "refs/heads/${DEPLOY_REF}"; then
+                git checkout "${DEPLOY_REF}"
+              else
+                git checkout -b "${DEPLOY_REF}" --track "origin/${DEPLOY_REF}"
+              fi
+              git merge --ff-only "origin/${DEPLOY_REF}"
+            elif git show-ref --verify --quiet "refs/tags/${DEPLOY_REF}"; then
+              git checkout --detach "refs/tags/${DEPLOY_REF}"
+            else
+              echo "origin/${DEPLOY_REF} (or tag) not found after fetch"
+              exit 1
+            fi
+
+            if [ "$had_env" -eq 1 ] && [ ! -f .env ]; then
+              echo "REFUSING: .env was present before git update and is now missing"
+              exit 1
+            fi
+            if [ "$had_override" -eq 1 ] && [ ! -f docker-compose.override.yml ]; then
+              echo "REFUSING: docker-compose.override.yml was present before git update and is now missing"
+              exit 1
+            fi
+            if [ "$had_data" -eq 1 ] && [ ! -e data ]; then
+              echo "REFUSING: data/ was present before git update and is now missing"
+              exit 1
+            fi
 
             compose_files="docker-compose.yml"
             if [ -f docker-compose.override.yml ]; then
@@ -78,16 +142,125 @@ jobs:
             fi
             if ! grep -qE '^[[:space:]]*build:' $compose_files; then
               echo "No build: section found. Copy docker-compose.prod.example.yml to docker-compose.override.yml so this fork is built from source (official calciumion/new-api does not include fork changes)."
+              echo "Keep the existing ./data:/data line. Do not change the host path on the left of that mount."
               exit 1
             fi
 
             if docker compose version >/dev/null 2>&1; then
-              docker compose up -d --build
-              docker compose ps
+              compose() { docker compose "$@"; }
             elif command -v docker-compose >/dev/null 2>&1; then
-              docker-compose up -d --build
-              docker-compose ps
+              compose() { docker-compose "$@"; }
             else
               echo "docker compose not found"
               exit 1
             fi
+
+            norm_path() {
+              if command -v realpath >/dev/null 2>&1; then
+                realpath -m "$1"
+              else
+                printf '%s' "$1"
+              fi
+            }
+
+            if docker inspect new-api >/dev/null 2>&1; then
+              echo "=== running new-api mounts (must stay the same) ==="
+              docker inspect new-api --format '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{println}}{{end}}'
+
+              current_workdir="$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+              if [ -n "$current_workdir" ]; then
+                if [ "$(norm_path "$current_workdir")" != "$(norm_path "$DEPLOY_PATH")" ]; then
+                  echo "REFUSING: running compose project is in ${current_workdir}, but DEPLOY_PATH is ${DEPLOY_PATH}."
+                  echo "A different directory creates a new empty named volume (looks like a wiped database)."
+                  echo "Point DEPLOY_PATH at the directory that is already running."
+                  exit 1
+                fi
+              fi
+
+              current_project="$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
+              planned_project=""
+              if [ -f .env ]; then
+                planned_project="$(grep -E '^[[:space:]]*COMPOSE_PROJECT_NAME=' .env | tail -n 1 | cut -d= -f2- | tr -d '\"' | tr -d "'" | tr -d '[:space:]' || true)"
+              fi
+              if [ -z "$planned_project" ]; then
+                planned_project="$(basename "$(norm_path "$DEPLOY_PATH")" | tr '[:upper:]' '[:lower:]')"
+              fi
+              if [ -n "$current_project" ] && [ "$current_project" != "$planned_project" ]; then
+                echo "REFUSING: compose project name would change from ${current_project} to ${planned_project}."
+                echo "That creates a new empty Postgres/MySQL volume. Put this in .env and retry:"
+                echo "COMPOSE_PROJECT_NAME=${current_project}"
+                exit 1
+              fi
+
+              current_data="$(docker inspect new-api --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+              if [ -z "$current_data" ]; then
+                echo "REFUSING: running new-api has no /data mount; refusing to guess a new data path"
+                exit 1
+              fi
+              if ! command -v python3 >/dev/null 2>&1; then
+                echo "REFUSING: python3 is required to verify /data and database volumes will not change"
+                exit 1
+              fi
+              CURRENT_DATA_SRC="$current_data"
+              CURRENT_PG_VOL=""
+              CURRENT_MYSQL_VOL=""
+              if docker inspect postgres >/dev/null 2>&1; then
+                echo "=== running postgres mounts ==="
+                docker inspect postgres --format '{{range .Mounts}}{{.Type}} {{.Name}} {{.Source}} -> {{.Destination}}{{println}}{{end}}'
+                CURRENT_PG_VOL="$(docker inspect postgres --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null || true)"
+              fi
+              if docker inspect mysql >/dev/null 2>&1; then
+                echo "=== running mysql mounts ==="
+                docker inspect mysql --format '{{range .Mounts}}{{.Type}} {{.Name}} {{.Source}} -> {{.Destination}}{{println}}{{end}}'
+                CURRENT_MYSQL_VOL="$(docker inspect mysql --format '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' 2>/dev/null || true)"
+              fi
+              export CURRENT_DATA_SRC CURRENT_PG_VOL CURRENT_MYSQL_VOL CURRENT_PROJECT="$current_project"
+              compose config --format json | python3 -c 'import json,os,sys
+            cfg=json.load(sys.stdin)
+            def norm(p):
+                return os.path.realpath(p) if p else ""
+            planned=""
+            for vol in (cfg.get("services") or {}).get("new-api", {}).get("volumes") or []:
+                if isinstance(vol, dict) and vol.get("target")=="/data":
+                    planned=vol.get("source") or ""
+                    break
+                if isinstance(vol, str) and vol.endswith(":/data"):
+                    planned=vol[:-6]
+                    break
+            current=os.environ.get("CURRENT_DATA_SRC") or ""
+            if not planned:
+                print("REFUSING: resolved compose no longer mounts /data"); sys.exit(1)
+            if norm(current)!=norm(planned):
+                print("REFUSING: /data host path would change")
+                print("current:", current)
+                print("planned:", planned)
+                print("Do not change the left-hand host path of ./data:/data")
+                sys.exit(1)
+            print("OK /data stays at", norm(planned))
+            volumes=cfg.get("volumes") or {}
+            project=os.environ.get("CURRENT_PROJECT") or ""
+            def named(key, default_suffix):
+                spec=volumes.get(key)
+                if isinstance(spec, dict) and spec.get("name"):
+                    return spec.get("name")
+                return (project+"_"+default_suffix) if project else ""
+            cur_pg=os.environ.get("CURRENT_PG_VOL") or ""
+            plan_pg=named("pg_data","pg_data")
+            if cur_pg and plan_pg and cur_pg!=plan_pg:
+                print("REFUSING: Postgres volume name would change"); print("current:", cur_pg); print("planned:", plan_pg); sys.exit(1)
+            if cur_pg:
+                print("OK postgres volume", cur_pg)
+            cur_my=os.environ.get("CURRENT_MYSQL_VOL") or ""
+            plan_my=named("mysql_data","mysql_data")
+            if cur_my and plan_my and cur_my!=plan_my:
+                print("REFUSING: MySQL volume name would change"); print("current:", cur_my); print("planned:", plan_my); sys.exit(1)
+            if cur_my:
+                print("OK mysql volume", cur_my)
+            '
+            fi
+
+            echo "=== resolved compose volume lines ==="
+            compose config | grep -E "source:|target:|name:|/data|pg_data|mysql_data" || true
+
+            compose up -d --build
+            compose ps
