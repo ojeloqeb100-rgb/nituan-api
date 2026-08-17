@@ -1,0 +1,45 @@
+# Personal VPS overlay for this fork.
+# Copy on the server (do not commit the copy):
+#   cp docker-compose.prod.example.yml docker-compose.override.yml
+# Docker Compose auto-merges docker-compose.override.yml with docker-compose.yml.
+#
+# Official compose uses image: calciumion/new-api:latest (Docker Hub, not GHCR).
+# That image does not include this fork's code, so production must build from the Dockerfile.
+#
+# Second disk: edit the volumes below to your real mount. Do not guess drive letters
+# in GitHub Actions. Workflows never run `docker compose down -v`.
+
+services:
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nituan-api:local
+    # Prefer loopback when a reverse proxy terminates TLS on the host.
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - VIDEO_CACHE_DIR=/data/video-cache
+      # Put secrets in a gitignored .env next to compose, then uncomment:
+      # - SESSION_SECRET=${SESSION_SECRET}
+      # - SESSION_COOKIE_SECURE=true
+      # - SESSION_COOKIE_TRUSTED_URL=${SESSION_COOKIE_TRUSTED_URL}
+      # - TRUSTED_PROXIES=172.16.0.0/12
+      # - SQL_DSN=${SQL_DSN}
+      # - REDIS_CONN_STRING=${REDIS_CONN_STRING}
+    # Sequence fields replace the base service list; keep every mount you need.
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+      # Bind the large disk here (replace with your mount). Either:
+      #   - /mnt/YOUR_LARGE_DISK:/data
+      #     (then remove ./data:/data so /data is not mounted twice)
+      # or keep ./data:/data for SQLite/app files and only cache videos on the large disk:
+      #   - /mnt/YOUR_LARGE_DISK/video-cache:/data/video-cache
+
+  # Uncomment together with matching values in .env (must stay in sync with SQL_DSN / REDIS_CONN_STRING):
+  # postgres:
+  #   environment:
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  # redis:
+  #   command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
