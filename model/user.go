@@ -1361,11 +1361,7 @@ func ReverseUserUsedQuota(id int, quota int) {
 	if quota <= 0 {
 		return
 	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUsedQuota, id, -quota)
-		return
-	}
-	updateUserUsedQuota(id, -quota)
+	UpdateUserUsedQuota(id, -quota)
 }
 
 // ReverseUserUsedQuotaAndRequestCount subtracts quota from used_quota and
@@ -1383,12 +1379,16 @@ func ReverseUserUsedQuotaAndRequestCount(id int, quota int) {
 	updateUserUsedQuotaAndRequestCount(id, -quota, -1)
 }
 
-func updateUserUsedQuota(id int, delta int) {
-	if delta == 0 {
+// UpdateUserUsedQuota adjusts accumulated usage without changing request count.
+func UpdateUserUsedQuota(id int, quota int) {
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
 		return
 	}
-	err := DB.Model(&User{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", delta)).Error
-	if err != nil {
+	if quota == 0 {
+		return
+	}
+	if err := DB.Model(&User{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error; err != nil {
 		common.SysLog("failed to update user used quota: " + err.Error())
 	}
 }
