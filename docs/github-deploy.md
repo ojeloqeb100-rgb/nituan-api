@@ -2,6 +2,9 @@
 
 这份说明只给 **本 fork**（`ojeloqeb100-rgb/nituan-api`）的个人 VPS 用，不是给 QuantumNous 官方仓库的通用发布流程。
 
+> **泥团中转站生产（`api.nituan.cc`）请只看：** [`nituan-production-update.md`](./nituan-production-update.md)。  
+> 那台机的目录是 **`/www/new-api`**，`DEPLOY_PATH` 必须填这个路径。本文里的 `/opt/nituan-api` 只用于「空机器第一次 clone」示例，**不是**当前生产路径。
+
 ## 结论（已有客户数据时先看这里）
 
 **这样更新不会丢客户数据**，前提同时成立：
@@ -20,7 +23,7 @@ GitHub 工作流 **不会** `git clean`、`git reset --hard`、`compose down` / 
 
 ## 已有生产实例：第一次用 GitHub 发版前
 
-「泥团中转站」如果已经在跑、里面有客户，按这个顺序做。**先备份，再改仓库/发版。**
+「泥团中转站」（`api.nituan.cc`，目录 **`/www/new-api`**）如果已经在跑、里面有客户：逐步命令、备份路径、Secrets 取值和禁止事项以 [`nituan-production-update.md`](./nituan-production-update.md) 为准。下面是通用要点。**先备份，再改仓库/发版。不要把 `DEPLOY_PATH` 填成 `/opt/nituan-api`。**
 
 ### 1. 在服务器上备份（必须）
 
@@ -208,7 +211,7 @@ docker exec postgres psql -U root -d new-api -c 'SELECT count(*) FROM users;'
 | `DEPLOY_HOST` | 是 | SSH 主机名或 IP（用域名也可以；不要把真实值提交到 git） |
 | `DEPLOY_USER` | 是 | SSH 登录用户（需能无密码使用 Docker） |
 | `DEPLOY_SSH_KEY` | 是 | 该用户的 **私钥全文**（含 `BEGIN` / `END` 行）。推荐 ED25519 |
-| `DEPLOY_PATH` | 是 | 服务器上**已经在跑**的仓库 **绝对路径**。已有生产必须填这个目录，不要填新 clone |
+| `DEPLOY_PATH` | 是 | 服务器上**已经在跑**的仓库 **绝对路径**。泥团生产必须是 `/www/new-api`，不要填 `/opt/nituan-api` 或新 clone |
 | `DEPLOY_PORT` | 否 | SSH 端口，缺省 `22` |
 | `DEPLOY_SSH_FINGERPRINT` | 否 | 主机公钥 SHA256 指纹，用于校验，防中间人。获取：`ssh-keygen -l -f /etc/ssh/ssh_host_ed25519_key.pub` |
 
@@ -235,6 +238,7 @@ ssh-keygen -t ed25519 -a 200 -C "github-actions-deploy" -f ./nituan-deploy -N ""
 必须 clone **fork**，不要 clone `QuantumNous/new-api`，否则拉下来的不是你的代码：
 
 ```bash
+# 空机器示例路径。泥团生产已经在 /www/new-api，不要再 clone 到这里。
 git clone https://github.com/ojeloqeb100-rgb/nituan-api.git /opt/nituan-api
 cd /opt/nituan-api
 git checkout main   # 若 main 还没有合并，可先 checkout 功能分支
@@ -268,7 +272,7 @@ TRUSTED_PROXIES=反代所在网卡的 CIDR
 首次启动（在填好 Secrets 并合并到 `main` 之前，可先手动跑通）：
 
 ```bash
-cd /opt/nituan-api
+cd /opt/nituan-api   # 空机器示例；泥团生产用 /www/new-api
 docker compose up -d --build
 ```
 
@@ -308,6 +312,7 @@ docker compose up -d --build
 | --- | --- |
 | `.github/workflows/deploy.yml` | SSH 部署（只更新代码/镜像，不删数据） |
 | `docker-compose.prod.example.yml` | 从源码构建；保留 `./data:/data`，可选追加 video-cache |
-| `docs/github-deploy.md` | 本文 |
+| `docs/github-deploy.md` | 本文（通用；空机器示例不要当成泥团生产路径） |
+| `docs/nituan-production-update.md` | 泥团生产（`/www/new-api`）操作手册 |
 
 官方 CI（`ci.yml`、`docker-build.yml` 等）未改。官方镜像仍走 Docker Hub `calciumion/new-api`，本 fork 不使用那条发布线。
