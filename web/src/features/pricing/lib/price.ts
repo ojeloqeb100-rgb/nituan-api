@@ -270,3 +270,71 @@ export function formatRequestPrice(
     abbreviate: false,
   })
 }
+
+export const VIDEO_RESOLUTIONS = ['480p', '720p', '1080p'] as const
+export type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number]
+
+export function isConfiguredVideoPrice(price: number | undefined): boolean {
+  return typeof price === 'number' && Number.isFinite(price) && price > 0
+}
+
+export function getConfiguredVideoResolutions(
+  model: Pick<PricingModel, 'video_prices'>
+): VideoResolution[] {
+  return VIDEO_RESOLUTIONS.filter((resolution) =>
+    isConfiguredVideoPrice(model.video_prices?.[resolution])
+  )
+}
+
+/** Format a per-second video price for a resolution and group. */
+export function formatVideoPrice(
+  model: PricingModel,
+  resolution: VideoResolution,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  selectedGroup?: string
+): string {
+  const basePrice = model.video_prices?.[resolution]
+  if (!isConfiguredVideoPrice(basePrice)) return '-'
+
+  const displayGroupRatio = getDisplayGroupRatio(model, selectedGroup)
+  const priceInUSD = applyRechargeRate(
+    (basePrice as number) * displayGroupRatio,
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+
+  return formatCurrencyFromUSD(priceInUSD, {
+    digitsLarge: 4,
+    digitsSmall: 6,
+    abbreviate: false,
+  })
+}
+
+export function formatVideoGroupPrice(
+  model: PricingModel,
+  resolution: VideoResolution,
+  group: string,
+  showWithRecharge = false,
+  priceRate = 1,
+  usdExchangeRate = 1,
+  groupRatio: Record<string, number> = {}
+): string {
+  const basePrice = model.video_prices?.[resolution]
+  if (!isConfiguredVideoPrice(basePrice)) return '-'
+
+  const priceInUSD = applyRechargeRate(
+    (basePrice as number) * getConfiguredGroupRatio(groupRatio, group),
+    showWithRecharge,
+    priceRate,
+    usdExchangeRate
+  )
+
+  return formatCurrencyFromUSD(priceInUSD, {
+    digitsLarge: 4,
+    digitsSmall: 6,
+    abbreviate: false,
+  })
+}

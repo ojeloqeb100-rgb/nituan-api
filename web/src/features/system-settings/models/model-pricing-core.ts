@@ -33,13 +33,16 @@ export const createModelPricingSchema = (t: (key: string) => string) =>
     imageRatio: z.string().optional(),
     audioRatio: z.string().optional(),
     audioCompletionRatio: z.string().optional(),
+    video480Price: z.string().optional(),
+    video720Price: z.string().optional(),
+    video1080Price: z.string().optional(),
   })
 
 export type ModelPricingFormValues = z.infer<
   ReturnType<typeof createModelPricingSchema>
 >
 
-export type PricingMode = 'per-token' | 'per-request' | 'tiered_expr'
+export type PricingMode = 'per-token' | 'per-request' | 'tiered_expr' | 'video'
 
 export type LaneKey =
   | 'completion'
@@ -62,6 +65,9 @@ export type ModelRatioData = {
   billingMode?: PricingMode
   billingExpr?: string
   requestRuleExpr?: string
+  video480Price?: string
+  video720Price?: string
+  video1080Price?: string
 }
 
 export type PreviewRow = {
@@ -144,6 +150,47 @@ export const laneConfigs: Array<{
   },
 ]
 
+export const VIDEO_TIER_VALIDATION_MESSAGE =
+  'Enter at least one video resolution price greater than 0. Leave unused resolutions empty.'
+
+export const VIDEO_TIER_EMPTY_HINT =
+  'Leave unused resolutions empty to disable that size. At least one priced tier is required.'
+
+export function parseVideoTierPrice(
+  value: string | undefined
+):
+  | { status: 'empty' }
+  | { status: 'invalid' }
+  | { status: 'ok'; value: number } {
+  if (value === undefined || value.trim() === '') {
+    return { status: 'empty' }
+  }
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) {
+    return { status: 'invalid' }
+  }
+  return { status: 'ok', value: number }
+}
+
+export function validateVideoTierPrices(values: {
+  video480Price?: string
+  video720Price?: string
+  video1080Price?: string
+}): { ok: true } | { ok: false; message: string } {
+  const parsed = [
+    parseVideoTierPrice(values.video480Price),
+    parseVideoTierPrice(values.video720Price),
+    parseVideoTierPrice(values.video1080Price),
+  ]
+  if (
+    parsed.some((item) => item.status === 'invalid') ||
+    !parsed.some((item) => item.status === 'ok')
+  ) {
+    return { ok: false, message: VIDEO_TIER_VALIDATION_MESSAGE }
+  }
+  return { ok: true }
+}
+
 export function hasValue(value: unknown): boolean {
   return (
     value !== '' && value !== null && value !== undefined && value !== false
@@ -217,6 +264,31 @@ export function buildPreviewRows(
   laneEnabled: Record<LaneKey, boolean>,
   t: (key: string) => string
 ): PreviewRow[] {
+  if (mode === 'video') {
+    return [
+      {
+        key: 'video480',
+        label: t('480P price'),
+        value: values.video480Price
+          ? `$${values.video480Price} / ${t('second')}`
+          : t('Empty'),
+      },
+      {
+        key: 'video720',
+        label: t('720P price'),
+        value: values.video720Price
+          ? `$${values.video720Price} / ${t('second')}`
+          : t('Empty'),
+      },
+      {
+        key: 'video1080',
+        label: t('1080P price'),
+        value: values.video1080Price
+          ? `$${values.video1080Price} / ${t('second')}`
+          : t('Empty'),
+      },
+    ]
+  }
   if (mode === 'tiered_expr') {
     const effectiveExpr = combineBillingExpr(billingExpr, requestRuleExpr)
     return [

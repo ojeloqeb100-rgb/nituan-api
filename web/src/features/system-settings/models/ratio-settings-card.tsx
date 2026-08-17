@@ -117,6 +117,7 @@ const createModelSchema = (t: Translate) =>
     ExposeRatioEnabled: z.boolean(),
     BillingMode: createJsonStringField(t),
     BillingExpr: createJsonStringField(t),
+    VideoPrices: createJsonStringField(t),
   })
 
 const createGroupSchema = (t: Translate) =>
@@ -195,6 +196,7 @@ export function RatioSettingsCard({
     ExposeRatioEnabled: modelDefaults.ExposeRatioEnabled,
     BillingMode: normalizeJsonString(modelDefaults.BillingMode),
     BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
+    VideoPrices: normalizeJsonString(modelDefaults.VideoPrices),
   })
   const [savedModelValues, setSavedModelValues] = useState(
     modelNormalizedDefaults.current
@@ -232,6 +234,7 @@ export function RatioSettingsCard({
       ),
       BillingMode: formatJsonForTextarea(modelDefaults.BillingMode),
       BillingExpr: formatJsonForTextarea(modelDefaults.BillingExpr),
+      VideoPrices: formatJsonForTextarea(modelDefaults.VideoPrices),
     },
   })
 
@@ -266,6 +269,7 @@ export function RatioSettingsCard({
       ExposeRatioEnabled: modelDefaults.ExposeRatioEnabled,
       BillingMode: normalizeJsonString(modelDefaults.BillingMode),
       BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
+      VideoPrices: normalizeJsonString(modelDefaults.VideoPrices),
     }
     setSavedModelValues(modelNormalizedDefaults.current)
 
@@ -283,6 +287,7 @@ export function RatioSettingsCard({
       ),
       BillingMode: formatJsonForTextarea(modelDefaults.BillingMode),
       BillingExpr: formatJsonForTextarea(modelDefaults.BillingExpr),
+      VideoPrices: formatJsonForTextarea(modelDefaults.VideoPrices),
     })
   }, [modelDefaults, modelForm])
 
@@ -327,11 +332,13 @@ export function RatioSettingsCard({
         ExposeRatioEnabled: values.ExposeRatioEnabled,
         BillingMode: normalizeJsonString(values.BillingMode),
         BillingExpr: normalizeJsonString(values.BillingExpr),
+        VideoPrices: normalizeJsonString(values.VideoPrices),
       }
 
       const apiKeyMap: Record<string, string> = {
         BillingMode: 'billing_setting.billing_mode',
         BillingExpr: 'billing_setting.billing_expr',
+        VideoPrices: 'billing_setting.video_prices',
       }
 
       const updates = (
@@ -345,9 +352,51 @@ export function RatioSettingsCard({
         return
       }
 
-      for (const key of updates) {
+      const videoKey = 'VideoPrices' as keyof ModelFormValues
+      const modeKey = 'BillingMode' as keyof ModelFormValues
+      const videoChanged = updates.includes(videoKey)
+      const modeChanged = updates.includes(modeKey)
+      const orderedUpdates: Array<keyof ModelFormValues> = []
+
+      if (videoChanged || modeChanged) {
+        const parseObject = (value: string) => {
+          try {
+            return JSON.parse(value) as Record<string, unknown>
+          } catch {
+            return {}
+          }
+        }
+        const currentVideo = parseObject(
+          modelNormalizedDefaults.current.VideoPrices
+        )
+        const nextVideo = parseObject(normalized.VideoPrices)
+        const bridgeVideo = { ...currentVideo, ...nextVideo }
+        const bridgeValue = JSON.stringify(bridgeVideo, null, 2)
+        if (bridgeValue !== modelNormalizedDefaults.current.VideoPrices) {
+          await updateOption.mutateAsync({
+            key: apiKeyMap.VideoPrices,
+            value: bridgeValue,
+          })
+        }
+        if (modeChanged) orderedUpdates.push(modeKey)
+        if (videoChanged && bridgeValue !== normalized.VideoPrices) {
+          orderedUpdates.push(videoKey)
+        }
+      }
+
+      for (const key of updates.filter(
+        (key) =>
+          !orderedUpdates.includes(key) && key !== videoKey && key !== modeKey
+      )) {
         const apiKey = apiKeyMap[key as string] || (key as string)
         await updateOption.mutateAsync({ key: apiKey, value: normalized[key] })
+      }
+
+      for (const key of orderedUpdates) {
+        await updateOption.mutateAsync({
+          key: apiKeyMap[key as string],
+          value: normalized[key],
+        })
       }
 
       modelNormalizedDefaults.current = normalized

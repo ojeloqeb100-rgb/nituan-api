@@ -292,3 +292,34 @@ func TestCacheUpdateChannelSyncsAdvancedCustomConfig(t *testing.T) {
 
 	assert.Nil(t, channel2advancedCustomConfig[401])
 }
+
+func TestPricingOpenAIChannelMetadataOpenAIVideoIsExposedToPlaza(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+
+	insertPricingEndpointChannel(t, 501, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
+	insertPricingEndpointAbility(t, 501, "doubao-seedance-2.0-mini")
+	require.NoError(t, DB.Create(&Model{
+		ModelName: "doubao-seedance-2.0-mini",
+		Endpoints: `{
+			"openai-video": {"path": "/v1/videos", "method": "POST"}
+		}`,
+		Status:   1,
+		NameRule: NameRuleExact,
+	}).Error)
+
+	byModel := pricingEndpointTypesByModel(t)
+
+	assert.Equal(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIVideo,
+	}, byModel["doubao-seedance-2.0-mini"])
+
+	info, ok := common.GetDefaultEndpointInfo(constant.EndpointTypeOpenAIVideo)
+	require.True(t, ok)
+	assert.Equal(t, "/v1/videos", info.Path)
+	assert.Equal(t, "POST", info.Method)
+
+	endpointMap := GetSupportedEndpointMap()
+	assert.Equal(t, "/v1/videos", endpointMap["openai-video"].Path)
+	assert.Equal(t, "POST", endpointMap["openai-video"].Method)
+}

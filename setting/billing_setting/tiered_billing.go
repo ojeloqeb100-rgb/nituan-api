@@ -11,20 +11,24 @@ import (
 const (
 	BillingModeRatio      = "ratio"
 	BillingModeTieredExpr = "tiered_expr"
+	BillingModeVideo      = "video"
 	BillingModeField      = "billing_mode"
 	BillingExprField      = "billing_expr"
+	VideoPricesField      = "video_prices"
 )
 
 // BillingSetting is managed by config.GlobalConfig.Register.
 // DB keys: billing_setting.billing_mode, billing_setting.billing_expr
 type BillingSetting struct {
-	BillingMode map[string]string `json:"billing_mode"`
-	BillingExpr map[string]string `json:"billing_expr"`
+	BillingMode map[string]string                `json:"billing_mode"`
+	BillingExpr map[string]string                `json:"billing_expr"`
+	VideoPrices map[string]VideoResolutionPrices `json:"video_prices"`
 }
 
 var billingSetting = BillingSetting{
 	BillingMode: make(map[string]string),
 	BillingExpr: make(map[string]string),
+	VideoPrices: make(map[string]VideoResolutionPrices),
 }
 
 func init() {
@@ -58,7 +62,16 @@ func GetBillingExprCopy() map[string]string {
 func GetPricingSyncData(base map[string]any) map[string]any {
 	extra := make(map[string]any, 2)
 	if modes := GetBillingModeCopy(); len(modes) > 0 {
-		extra[BillingModeField] = modes
+		// Video prices are local absolute prices and are not supported by the
+		// upstream ratio-sync contract. Do not export a dangling video mode.
+		for model, mode := range modes {
+			if mode == BillingModeVideo {
+				delete(modes, model)
+			}
+		}
+		if len(modes) > 0 {
+			extra[BillingModeField] = modes
+		}
 	}
 	if exprs := GetBillingExprCopy(); len(exprs) > 0 {
 		extra[BillingExprField] = exprs

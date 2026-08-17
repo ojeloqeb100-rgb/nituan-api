@@ -332,6 +332,14 @@ func InitResources() error {
 	if err != nil {
 		return err
 	}
+	if common.IsMasterNode {
+		if err := model.ReconcileRefundUsedQuotaIfNeeded(); err != nil {
+			common.SysError("refund used_quota reconcile failed: " + err.Error())
+		}
+		if err := model.ReconcileRefundRequestCountIfNeeded(); err != nil {
+			common.SysError("refund request_count reconcile failed: " + err.Error())
+		}
+	}
 
 	// Initialize Redis
 	err = common.InitRedisClient()
@@ -363,6 +371,7 @@ func InitResources() error {
 	}
 
 	service.StartAuthArtifactCleanup()
+	service.StartVideoCacheMaintenance()
 
 	return nil
 }

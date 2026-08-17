@@ -79,6 +79,14 @@ type TaskAdaptor interface {
 	ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error)
 }
 
+// TaskPerCallPriceEstimator provides an absolute per-request price for task
+// adaptors whose price depends on request fields such as video resolution.
+// The caller applies duration and other billing ratios before the single quota
+// conversion, avoiding truncation of a small base price.
+type TaskPerCallPriceEstimator interface {
+	EstimatePerCallPrice(c *gin.Context, info *relaycommon.RelayInfo) (float64, *taskdto.TaskError)
+}
+
 type OpenAIVideoConverter interface {
 	ConvertToOpenAIVideo(originTask *model.Task) ([]byte, error)
 }

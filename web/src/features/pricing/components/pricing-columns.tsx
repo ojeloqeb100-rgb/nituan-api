@@ -38,6 +38,8 @@ import { isTokenBasedModel } from '../lib/model-helpers'
 import {
   formatPrice,
   formatRequestPrice,
+  formatVideoPrice,
+  getConfiguredVideoResolutions,
   stripTrailingZeros,
 } from '../lib/price'
 import type { PricingModel, TokenUnit } from '../types'
@@ -114,6 +116,45 @@ export function usePricingColumns(
       ),
       cell: ({ row }) => {
         const model = row.original
+        if (model.billing_mode === 'video') {
+          const videoResolutions = getConfiguredVideoResolutions(model)
+          if (videoResolutions.length === 0) {
+            return (
+              <span className='text-muted-foreground text-sm'>
+                {t('Video pricing unavailable')}
+              </span>
+            )
+          }
+          return (
+            <div className='max-w-full min-w-0'>
+              <span className='font-mono text-sm tabular-nums'>
+                {videoResolutions.map((resolution, index) => (
+                  <span key={resolution}>
+                    {index > 0 && (
+                      <span className='text-muted-foreground/40 mx-1'>/</span>
+                    )}
+                    {stripTrailingZeros(
+                      formatVideoPrice(
+                        model,
+                        resolution,
+                        showRechargePrice,
+                        priceRate,
+                        usdExchangeRate,
+                        selectedGroup
+                      )
+                    )}
+                  </span>
+                ))}
+              </span>
+              <div className='text-muted-foreground/50 text-[10px]'>
+                / {t('second')} ·{' '}
+                {videoResolutions
+                  .map((resolution) => resolution.toUpperCase())
+                  .join(' / ')}
+              </div>
+            </div>
+          )
+        }
         const dynamicSummary = getDynamicPricingSummary(model, {
           tokenUnit,
           showRechargePrice,

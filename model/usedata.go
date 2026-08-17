@@ -36,6 +36,9 @@ type QuotaDataLogParams struct {
 	TokenID   int
 	ChannelID int
 	NodeName  string
+	// Count is the quota_data.count delta. nil means the consume default of 1.
+	// Failure refunds pass -1; price-recalculate refunds pass 0.
+	Count *int
 }
 
 func UpdateQuotaData() {
@@ -78,6 +81,10 @@ func logQuotaDataCache(quotaData *QuotaData) {
 func LogQuotaData(params QuotaDataLogParams) {
 	// 只精确到小时
 	createdAt := params.CreatedAt - (params.CreatedAt % 3600)
+	count := 1
+	if params.Count != nil {
+		count = *params.Count
+	}
 	quotaData := &QuotaData{
 		UserID:    params.UserID,
 		Username:  params.Username,
@@ -87,7 +94,7 @@ func LogQuotaData(params QuotaDataLogParams) {
 		TokenID:   params.TokenID,
 		ChannelID: params.ChannelID,
 		NodeName:  params.NodeName,
-		Count:     1,
+		Count:     count,
 		Quota:     params.Quota,
 		TokenUsed: params.TokenUsed,
 	}
@@ -124,12 +131,19 @@ func SaveQuotaDataCache() {
 	common.SysLog(fmt.Sprintf("保存数据看板数据成功，共保存%d条数据", size))
 }
 
+func quotaDataCountAddExpr(delta int) interface{} {
+	if delta >= 0 {
+		return gorm.Expr("count + ?", delta)
+	}
+	return gorm.Expr("CASE WHEN count + ? < 0 THEN 0 ELSE count + ? END", delta, delta)
+}
+
 func increaseQuotaData(quotaData *QuotaData) {
 	err := DB.Table("quota_data").
 		Where("user_id = ? and username = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
 			quotaData.UserID, quotaData.Username, quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
 		Updates(map[string]interface{}{
-			"count":      gorm.Expr("count + ?", quotaData.Count),
+			"count":      quotaDataCountAddExpr(quotaData.Count),
 			"quota":      gorm.Expr("quota + ?", quotaData.Quota),
 			"token_used": gorm.Expr("token_used + ?", quotaData.TokenUsed),
 		}).Error

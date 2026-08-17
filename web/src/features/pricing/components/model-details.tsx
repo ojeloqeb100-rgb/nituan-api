@@ -68,7 +68,12 @@ import {
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
 import { getAvailableGroups, isTokenBasedModel } from '../lib/model-helpers'
-import { formatFixedPrice, formatGroupPrice } from '../lib/price'
+import {
+  formatFixedPrice,
+  formatGroupPrice,
+  formatVideoGroupPrice,
+  getConfiguredVideoResolutions,
+} from '../lib/price'
 import type {
   ModelCapability,
   PriceType,
@@ -702,6 +707,58 @@ function PriceSection(props: {
     )
   }
 
+  if (props.model.billing_mode === 'video') {
+    const videoResolutions = getConfiguredVideoResolutions(props.model)
+    const videoGridCols = [
+      'grid-cols-1',
+      'grid-cols-1',
+      'grid-cols-2',
+      'grid-cols-3',
+    ]
+    return (
+      <section>
+        <SectionTitle>{t('Base Price')}</SectionTitle>
+        {videoResolutions.length === 0 ? (
+          <p className='text-muted-foreground text-sm'>
+            {t('Video pricing unavailable')}
+          </p>
+        ) : (
+          <div
+            className={cn(
+              'grid gap-2',
+              videoGridCols[Math.min(videoResolutions.length, 3)]
+            )}
+          >
+            {videoResolutions.map((resolution) => (
+              <div
+                key={resolution}
+                className='bg-muted/20 rounded-lg border p-3'
+              >
+                <div className='text-muted-foreground text-xs'>
+                  {resolution.toUpperCase()}
+                </div>
+                <div className='text-foreground mt-1 font-mono text-base font-semibold tabular-nums'>
+                  {formatVideoGroupPrice(
+                    props.model,
+                    resolution,
+                    baseGroupKey,
+                    props.showRechargePrice,
+                    props.priceRate,
+                    props.usdExchangeRate,
+                    baseGroupRatioMap
+                  )}
+                  <span className='text-muted-foreground/40 ml-1 text-xs font-normal'>
+                    / {t('second')}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    )
+  }
+
   if (!isTokenBased) {
     return (
       <section>
@@ -1017,6 +1074,47 @@ function GroupPricingSection(props: {
             {t('Prices shown per')} {tokenUnitLabel} tokens
           </p>
         </div>
+      </section>
+    )
+  }
+
+  if (props.model.billing_mode === 'video') {
+    return (
+      <section>
+        <SectionTitle>{t('Pricing by Group')}</SectionTitle>
+        <AutoGroupChain model={props.model} autoGroups={props.autoGroups} />
+        <StaticDataTable
+          className='-mx-4 rounded-none border-0 sm:mx-0'
+          tableClassName='text-sm'
+          headerRowClassName='hover:bg-transparent'
+          data={availableGroups}
+          getRowKey={(group) => group}
+          columns={[
+            {
+              id: 'group',
+              header: t('Group'),
+              className: thClass,
+              cellClassName: 'py-2.5',
+              cell: (group) => <GroupBadge group={group} size='sm' />,
+            },
+            ...getConfiguredVideoResolutions(props.model).map((resolution) => ({
+              id: resolution,
+              header: resolution.toUpperCase(),
+              className: `${thClass} text-right`,
+              cellClassName: 'py-2.5 text-right font-mono',
+              cell: (group: string) =>
+                `${formatVideoGroupPrice(
+                  props.model,
+                  resolution,
+                  group,
+                  showRechargePrice,
+                  props.priceRate,
+                  props.usdExchangeRate,
+                  props.groupRatio
+                )} / ${t('second')}`,
+            })),
+          ]}
+        />
       </section>
     )
   }

@@ -22,14 +22,19 @@ import { Music } from 'lucide-react'
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { CopyButton } from '@/components/copy-button'
 import { StatusBadge } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
 import { formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-import { TASK_ACTIONS, TASK_STATUS } from '../../constants'
+import { TASK_STATUS } from '../../constants'
 import { taskActionMapper, taskStatusMapper } from '../../lib/mappers'
+import {
+  displayTaskFailReason,
+  resolveTaskVideoHref,
+} from '../../lib/task-video-url'
 import type { TaskLog } from '../../types'
 import {
   AudioPreviewDialog,
@@ -238,30 +243,24 @@ export function useTaskLogsColumns(isAdmin: boolean): ColumnDef<TaskLog>[] {
           }
         }
 
-        const isVideoTask =
-          log.action === TASK_ACTIONS.GENERATE ||
-          log.action === TASK_ACTIONS.TEXT_GENERATE ||
-          log.action === TASK_ACTIONS.FIRST_TAIL_GENERATE ||
-          log.action === TASK_ACTIONS.REFERENCE_GENERATE ||
-          log.action === TASK_ACTIONS.REMIX_GENERATE
-        const isSuccess = status === TASK_STATUS.SUCCESS
-        const isUrl = failReason?.startsWith('http')
-
-        if (isSuccess && isVideoTask && isUrl) {
-          const videoUrl = `/v1/videos/${log.task_id}/content`
+        const videoUrl = resolveTaskVideoHref(log)
+        if (videoUrl) {
           return (
-            <a
-              href={videoUrl}
-              target='_blank'
-              rel='noopener noreferrer'
-              className='text-foreground text-xs hover:underline'
+            <CopyButton
+              value={videoUrl}
+              variant='ghost'
+              size='sm'
+              className='h-auto gap-1 px-1.5 py-0.5 text-xs'
+              tooltip={t('Copy link')}
+              aria-label={t('Copy link')}
             >
-              {t('Click to preview video')}
-            </a>
+              {t('Copy link')}
+            </CopyButton>
           )
         }
 
-        if (!failReason) {
+        const visibleFailReason = displayTaskFailReason(failReason)
+        if (!visibleFailReason) {
           return <span className='text-muted-foreground/60 text-xs'>-</span>
         }
 
@@ -274,11 +273,11 @@ export function useTaskLogsColumns(isAdmin: boolean): ColumnDef<TaskLog>[] {
               title={t('Click to view full error message')}
             >
               <span className='truncate leading-snug text-red-600 group-hover:underline dark:text-red-400'>
-                {failReason}
+                {visibleFailReason}
               </span>
             </button>
             <FailReasonDialog
-              failReason={failReason}
+              failReason={visibleFailReason}
               open={dialogOpen}
               onOpenChange={setDialogOpen}
             />

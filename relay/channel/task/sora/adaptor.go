@@ -9,6 +9,8 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -17,7 +19,9 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaykitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
@@ -91,7 +95,101 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	if info.Action == constant.TaskActionRemix {
 		return validateRemixRequest(c)
 	}
-	return relaycommon.ValidateMultipartDirect(c, info)
+	if taskErr = relaycommon.ValidateMultipartDirect(c, info); taskErr != nil {
+		return taskErr
+	}
+	if billing_setting.GetBillingMode(taskModelName(c, info)) == billing_setting.BillingModeVideo {
+		return validateVideoBillingRequest(c, info)
+	}
+	return nil
+}
+
+func taskModelName(c *gin.Context, info *relaycommon.RelayInfo) string {
+	if req, err := relaycommon.GetTaskRequest(c); err == nil && strings.TrimSpace(req.Model) != "" {
+		return req.Model
+	}
+	return info.OriginModelName
+}
+
+func validateVideoBillingRequest(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+	if info.Action == constant.TaskActionRemix {
+		return nil
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if strings.TrimSpace(req.Seconds) != "" {
+		seconds, parseErr := strconv.Atoi(strings.TrimSpace(req.Seconds))
+		if parseErr != nil || seconds < 1 || seconds > relaycommon.MaxTaskDurationSeconds {
+			return service.TaskErrorWrapperLocal(fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds), "invalid_seconds", http.StatusBadRequest)
+		}
+	}
+	size := req.Size
+	if size == "" {
+		size = "720x1280"
+	}
+	resolution, ok := NormalizeVideoResolution(size)
+	if !ok {
+		return service.TaskErrorWrapperLocal(fmt.Errorf("unsupported video size: %s", size), "invalid_size", http.StatusBadRequest)
+	}
+	modelName := taskModelName(c, info)
+	if _, priced := billing_setting.GetVideoPrice(modelName, resolution); !priced {
+		return service.TaskErrorWrapperLocal(fmt.Errorf("video price for model %s and resolution %s is not configured", modelName, resolution), "model_price_error", http.StatusBadRequest)
+	}
+	return nil
+}
+
+// NormalizeVideoResolution maps the exact size spellings used by common video
+// providers to the three billing tiers. It intentionally rejects fuzzy sizes
+// so a malformed or provider-specific value cannot fall into a cheaper tier.
+func NormalizeVideoResolution(size string) (string, bool) {
+	return billing_setting.NormalizeVideoResolution(size)
+}
+
+func (a *TaskAdaptor) EstimatePerCallPrice(c *gin.Context, info *relaycommon.RelayInfo) (float64, *dto.TaskError) {
+	if info.BillingMode != billing_setting.BillingModeVideo &&
+		billing_setting.GetBillingMode(info.OriginModelName) != billing_setting.BillingModeVideo {
+		return 0, nil
+	}
+
+	// A remix with a billing snapshot already has the exact absolute price and
+	// ratios from its source task. Reusing it prevents a later price edit from
+	// changing the historical charge.
+	if info.Action == constant.TaskActionRemix && info.PriceData.UsePrice && info.PriceData.ModelPrice > 0 {
+		return info.PriceData.ModelPrice, nil
+	}
+
+	resolution := info.VideoResolution
+	if resolution == "" && info.Action == constant.TaskActionRemix {
+		if ratios := info.PriceData.OtherRatios(); ratios != nil && ratios["size"] > 1.1 {
+			resolution = billing_setting.VideoResolution1080P
+		} else {
+			resolution = billing_setting.VideoResolution720P
+		}
+	}
+	if resolution == "" {
+		req, err := relaycommon.GetTaskRequest(c)
+		if err != nil {
+			return 0, service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+		}
+		size := req.Size
+		if size == "" {
+			size = "720x1280"
+		}
+		var ok bool
+		resolution, ok = NormalizeVideoResolution(size)
+		if !ok {
+			return 0, service.TaskErrorWrapperLocal(fmt.Errorf("unsupported video size: %s", size), "invalid_size", http.StatusBadRequest)
+		}
+	}
+	price, ok := billing_setting.GetVideoPrice(info.OriginModelName, resolution)
+	if !ok {
+		return 0, service.TaskErrorWrapperLocal(fmt.Errorf("video price for model %s and resolution %s is not configured", info.OriginModelName, resolution), "model_price_error", http.StatusBadRequest)
+	}
+	info.BillingMode = billing_setting.BillingModeVideo
+	info.VideoResolution = resolution
+	return price, nil
 }
 
 // EstimateBilling 根据用户请求的 seconds 和 size 计算 OtherRatios。
@@ -106,17 +204,20 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		return nil
 	}
 
-	seconds, _ := strconv.Atoi(req.Seconds)
-	if seconds == 0 {
-		seconds = req.Duration
-	}
-	if seconds <= 0 {
-		seconds = 4
-	}
+	seconds := effectiveSeconds(req)
 
 	size := req.Size
 	if size == "" {
 		size = "720x1280"
+	}
+	if billing_setting.GetBillingMode(info.OriginModelName) == billing_setting.BillingModeVideo {
+		_, ok := NormalizeVideoResolution(size)
+		if !ok {
+			return nil
+		}
+		return map[string]float64{
+			"seconds": float64(seconds),
+		}
 	}
 
 	ratios := map[string]float64{
@@ -127,6 +228,17 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		ratios["size"] = 1.666667
 	}
 	return ratios
+}
+
+func effectiveSeconds(req relaycommon.TaskSubmitReq) int {
+	seconds, _ := strconv.Atoi(strings.TrimSpace(req.Seconds))
+	if seconds == 0 {
+		seconds = req.Duration
+	}
+	if seconds <= 0 {
+		seconds = 4
+	}
+	return seconds
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
@@ -158,6 +270,9 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		var bodyMap map[string]interface{}
 		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
 			bodyMap["model"] = info.UpstreamModelName
+			if err := applyUpstreamVideoFields(bodyMap, c, info, a.ChannelType); err != nil {
+				return nil, err
+			}
 			if newBody, err := common.Marshal(bodyMap); err == nil {
 				return bytes.NewReader(newBody), nil
 			}
@@ -233,26 +348,30 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	}
 	_ = resp.Body.Close()
 
-	// Parse Sora response
-	var dResp responseTask
-	if err := common.Unmarshal(responseBody, &dResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
-		return
-	}
-
-	upstreamID := dResp.ID
-	if upstreamID == "" {
-		upstreamID = dResp.TaskID
-	}
+	upstreamID := extractUpstreamVideoTaskID(responseBody)
 	if upstreamID == "" {
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty"), "invalid_response", http.StatusInternalServerError)
 		return
 	}
 
-	// 使用公开 task_xxxx ID 返回给客户端
-	dResp.ID = info.PublicTaskID
-	dResp.TaskID = info.PublicTaskID
-	c.JSON(http.StatusOK, dResp)
+	if looksLikeOpenAIVideo(responseBody) {
+		var dResp responseTask
+		if err := common.Unmarshal(responseBody, &dResp); err != nil {
+			taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+			return
+		}
+		dResp.ID = info.PublicTaskID
+		dResp.TaskID = info.PublicTaskID
+		c.JSON(http.StatusOK, dResp)
+		return upstreamID, responseBody, nil
+	}
+
+	ov := relaykitdto.NewOpenAIVideo()
+	ov.ID = info.PublicTaskID
+	ov.TaskID = info.PublicTaskID
+	ov.CreatedAt = time.Now().Unix()
+	ov.Model = info.OriginModelName
+	c.JSON(http.StatusOK, ov)
 	return upstreamID, responseBody, nil
 }
 
@@ -288,44 +407,315 @@ func (a *TaskAdaptor) GetChannelName() string {
 }
 
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
-	resTask := responseTask{}
-	if err := common.Unmarshal(respBody, &resTask); err != nil {
-		return nil, errors.Wrap(err, "unmarshal task result failed")
+	status, progress, reason, videoURL, err := parseUpstreamVideoTask(respBody)
+	if err != nil {
+		return nil, err
 	}
 
 	taskResult := relaycommon.TaskInfo{
 		Code: 0,
 	}
 
-	switch resTask.Status {
+	switch status {
 	case "queued", "pending":
 		taskResult.Status = model.TaskStatusQueued
-	case "processing", "in_progress":
+	case "processing", "in_progress", "running":
 		taskResult.Status = model.TaskStatusInProgress
-	case "completed":
+	case "completed", "succeeded", "succeed", "success":
 		taskResult.Status = model.TaskStatusSuccess
-		// Url intentionally left empty — the caller constructs the proxy URL using the public task ID
-	case "failed", "cancelled":
+		taskResult.Url = videoURL
+	case "failed", "cancelled", "canceled":
 		taskResult.Status = model.TaskStatusFailure
-		if resTask.Error != nil {
-			taskResult.Reason = resTask.Error.Message
+		if reason != "" {
+			taskResult.Reason = reason
 		} else {
 			taskResult.Reason = "task failed"
 		}
 	default:
 	}
-	if resTask.Progress > 0 && resTask.Progress < 100 {
-		taskResult.Progress = fmt.Sprintf("%d%%", resTask.Progress)
+	if progress > 0 && progress < 100 {
+		taskResult.Progress = fmt.Sprintf("%d%%", progress)
 	}
 
 	return &taskResult, nil
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
-	data := task.Data
-	var err error
-	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
-		return nil, errors.Wrap(err, "set id failed")
+	if looksLikeOpenAIVideo(task.Data) {
+		data, err := sjson.SetBytes(task.Data, "id", task.TaskID)
+		if err != nil {
+			return nil, errors.Wrap(err, "set id failed")
+		}
+		if data, err = sjson.SetBytes(data, "task_id", task.TaskID); err != nil {
+			return nil, errors.Wrap(err, "set task_id failed")
+		}
+		if _, _, _, videoURL, parseErr := parseUpstreamVideoTask(task.Data); parseErr == nil && httpOrDataVideoURL(videoURL) != "" {
+			if data, err = sjson.SetBytes(data, "metadata.url", taskcommon.BuildProxyURL(task.TaskID)); err != nil {
+				return nil, errors.Wrap(err, "set metadata url failed")
+			}
+		}
+		return data, nil
 	}
-	return data, nil
+
+	_, progress, reason, videoURL, err := parseUpstreamVideoTask(task.Data)
+	if err != nil {
+		return nil, err
+	}
+	ov := relaykitdto.NewOpenAIVideo()
+	ov.ID = task.TaskID
+	ov.TaskID = task.TaskID
+	ov.Status = task.Status.ToVideoStatus()
+	ov.Model = task.Properties.OriginModelName
+	ov.CreatedAt = task.CreatedAt
+	ov.CompletedAt = task.UpdatedAt
+	if task.Progress != "" {
+		ov.SetProgressStr(task.Progress)
+	} else if progress > 0 {
+		ov.SetProgressStr(fmt.Sprintf("%d%%", progress))
+	}
+	if videoURL != "" {
+		ov.SetMetadata("url", taskcommon.BuildProxyURL(task.TaskID))
+	}
+	if task.Status == model.TaskStatusFailure && reason != "" {
+		ov.Error = &relaykitdto.OpenAIVideoError{Message: reason}
+	}
+	return common.Marshal(ov)
+}
+
+func applyUpstreamVideoFields(bodyMap map[string]any, c *gin.Context, info *relaycommon.RelayInfo, channelType int) error {
+	if info != nil && info.TaskRelayInfo != nil && info.Action == constant.TaskActionRemix {
+		relaycommon.ApplyVideoSecondsForUpstream(bodyMap, channelType)
+		return nil
+	}
+	if channelType == constant.ChannelTypeSora {
+		relaycommon.ApplyVideoSecondsForUpstream(bodyMap, channelType)
+		return nil
+	}
+
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		raw, marshalErr := common.Marshal(bodyMap)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if unmarshalErr := common.Unmarshal(raw, &req); unmarshalErr != nil {
+			return unmarshalErr
+		}
+	}
+
+	seconds := effectiveSeconds(req)
+	if seconds < 1 || seconds > relaycommon.MaxTaskDurationSeconds {
+		return fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+	}
+	size := req.Size
+	if size == "" {
+		size = stringFromAny(bodyMap["size"])
+	}
+	if size == "" {
+		size = "720x1280"
+	}
+	aspectRatio, ok := aspectRatioFromSize(size)
+	if !ok {
+		return fmt.Errorf("unsupported video size: %s", size)
+	}
+	bodyMap["duration"] = seconds
+	bodyMap["aspect_ratio"] = aspectRatio
+	delete(bodyMap, "seconds")
+	delete(bodyMap, "size")
+	return nil
+}
+
+func aspectRatioFromSize(size string) (string, bool) {
+	if _, ok := NormalizeVideoResolution(size); !ok {
+		return "", false
+	}
+	value := normalizeVideoSizeKey(size)
+	if width, height, ok := parseVideoPixelSize(value); ok {
+		if width >= height {
+			return "16:9", true
+		}
+		return "9:16", true
+	}
+	return "16:9", true
+}
+
+func normalizeVideoSizeKey(size string) string {
+	value := strings.ToLower(strings.TrimSpace(size))
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, value)
+	return strings.NewReplacer("×", "x", "*", "x").Replace(value)
+}
+
+func parseVideoPixelSize(value string) (int, int, bool) {
+	parts := strings.Split(value, "x")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	width, errW := strconv.Atoi(parts[0])
+	height, errH := strconv.Atoi(parts[1])
+	if errW != nil || errH != nil || width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+func extractUpstreamVideoTaskID(body []byte) string {
+	var top map[string]any
+	if err := common.Unmarshal(body, &top); err != nil {
+		return ""
+	}
+	if id := stringFromAny(top["id"]); id != "" {
+		return id
+	}
+	if id := stringFromAny(top["task_id"]); id != "" {
+		return id
+	}
+	switch data := top["data"].(type) {
+	case []any:
+		if len(data) == 0 {
+			return ""
+		}
+		item, ok := data[0].(map[string]any)
+		if !ok {
+			return ""
+		}
+		if id := stringFromAny(item["task_id"]); id != "" {
+			return id
+		}
+		return stringFromAny(item["id"])
+	case map[string]any:
+		if id := stringFromAny(data["task_id"]); id != "" {
+			return id
+		}
+		return stringFromAny(data["id"])
+	default:
+		return ""
+	}
+}
+
+func looksLikeOpenAIVideo(body []byte) bool {
+	var top map[string]any
+	if err := common.Unmarshal(body, &top); err != nil {
+		return false
+	}
+	if _, hasData := top["data"]; hasData {
+		if _, hasStatus := top["status"]; !hasStatus {
+			return false
+		}
+	}
+	if stringFromAny(top["object"]) == "video" {
+		return true
+	}
+	_, hasID := top["id"]
+	_, hasStatus := top["status"]
+	return hasID && hasStatus
+}
+
+func parseUpstreamVideoTask(body []byte) (status string, progress int, reason string, videoURL string, err error) {
+	var top map[string]any
+	if err = common.Unmarshal(body, &top); err != nil {
+		return "", 0, "", "", errors.Wrap(err, "unmarshal task result failed")
+	}
+	status = stringFromAny(top["status"])
+	progress = intFromAny(top["progress"])
+	reason = errorMessageFromAny(top["error"])
+	if data, ok := top["data"].(map[string]any); ok {
+		if status == "" {
+			status = stringFromAny(data["status"])
+		}
+		if progress == 0 {
+			progress = intFromAny(data["progress"])
+		}
+		if reason == "" {
+			reason = errorMessageFromAny(data["error"])
+		}
+		videoURL = firstVideoURL(data)
+	}
+	if videoURL == "" {
+		videoURL = firstVideoURL(top)
+	}
+	return status, progress, reason, videoURL, nil
+}
+
+func firstVideoURL(root map[string]any) string {
+	if root == nil {
+		return ""
+	}
+	if found := httpOrDataVideoURL(stringFromAny(root["url"])); found != "" {
+		return found
+	}
+	if metadata, _ := root["metadata"].(map[string]any); metadata != nil {
+		if found := httpOrDataVideoURL(stringFromAny(metadata["url"])); found != "" {
+			return found
+		}
+	}
+	result, _ := root["result"].(map[string]any)
+	if result == nil {
+		result = root
+	}
+	videos, _ := result["videos"].([]any)
+	if len(videos) == 0 {
+		return ""
+	}
+	video, _ := videos[0].(map[string]any)
+	if video == nil {
+		return ""
+	}
+	switch raw := video["url"].(type) {
+	case string:
+		return raw
+	case []any:
+		if len(raw) == 0 {
+			return ""
+		}
+		return stringFromAny(raw[0])
+	default:
+		return ""
+	}
+}
+
+func httpOrDataVideoURL(raw string) string {
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") {
+		return raw
+	}
+	return ""
+}
+
+func stringFromAny(v any) string {
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
+
+func intFromAny(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(n))
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func errorMessageFromAny(v any) string {
+	switch errVal := v.(type) {
+	case string:
+		return strings.TrimSpace(errVal)
+	case map[string]any:
+		if msg := stringFromAny(errVal["message"]); msg != "" {
+			return msg
+		}
+		return stringFromAny(errVal["code"])
+	default:
+		return ""
+	}
 }

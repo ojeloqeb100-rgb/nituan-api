@@ -413,6 +413,12 @@ func FetchUpstreamRatios(c *gin.Context) {
 				if item.ModelName == "" {
 					continue
 				}
+				// Video pricing is an absolute local policy with three resolution
+				// prices. The sync payload does not carry those prices, so importing
+				// the model as a fixed price would create a zero-cost configuration.
+				if item.BillingMode == billing_setting.BillingModeVideo {
+					continue
+				}
 				if item.BillingMode == billing_setting.BillingModeTieredExpr && strings.TrimSpace(item.BillingExpr) != "" {
 					billingModeMap[item.ModelName] = billing_setting.BillingModeTieredExpr
 					billingExprMap[item.ModelName] = item.BillingExpr

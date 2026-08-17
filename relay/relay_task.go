@@ -2,9 +2,11 @@ package relay
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +21,8 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -107,34 +111,110 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 
 	// 提取 remix 参数（时长、分辨率 → OtherRatios）
 	if info.Action == constant.TaskActionRemix {
-		if originTask.PrivateData.BillingContext != nil {
-			// 新的 remix 逻辑：直接从原始任务的 BillingContext 中提取 OtherRatios（如果存在）
-			for s, f := range originTask.PrivateData.BillingContext.OtherRatios {
-				info.PriceData.AddOtherRatio(s, f)
-			}
-		} else {
-			// 旧的 remix 逻辑：直接从 task data 解析 seconds 和 size（如果存在）
-			var taskData map[string]interface{}
-			_ = common.Unmarshal(originTask.Data, &taskData)
-			secondsStr, _ := taskData["seconds"].(string)
-			seconds, _ := strconv.Atoi(secondsStr)
-			if seconds <= 0 {
-				seconds = 4
-			}
-			// 历史任务数据可能包含未经校验的时长，作为计费乘数前必须钳制
-			if seconds > relaycommon.MaxTaskDurationSeconds {
-				seconds = relaycommon.MaxTaskDurationSeconds
-			}
-			sizeStr, _ := taskData["size"].(string)
-			info.PriceData.AddOtherRatio("seconds", float64(seconds))
-			info.PriceData.AddOtherRatio("size", 1)
-			if sizeStr == "1792x1024" || sizeStr == "1024x1792" {
-				info.PriceData.AddOtherRatio("size", 1.666667)
-			}
+		if taskErr := applyOriginTaskRemixBilling(info, originTask); taskErr != nil {
+			return taskErr
 		}
 	}
 
 	return nil
+}
+
+// applyOriginTaskRemixBilling copies remix billing from the origin task.
+// A stored BillingContext snapshot is reused as-is. Older tasks without a
+// snapshot fall back to seconds/size stored on task data.
+func applyOriginTaskRemixBilling(info *relaycommon.RelayInfo, originTask *model.Task) *dto.TaskError {
+	if originTask.PrivateData.BillingContext != nil {
+		billingContext := originTask.PrivateData.BillingContext
+		info.BillingMode = billingContext.BillingMode
+		info.VideoResolution = billingContext.VideoResolution
+		info.PriceData.ModelPrice = billingContext.ModelPrice
+		info.PriceData.UsePrice = billingContext.PerCallBilling
+		for s, f := range billingContext.OtherRatios {
+			info.PriceData.AddOtherRatio(s, f)
+		}
+		return nil
+	}
+	var taskData map[string]any
+	if err := common.Unmarshal(originTask.Data, &taskData); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_origin_task_data", http.StatusBadRequest)
+	}
+	seconds, err := remixSecondsFromTaskData(taskData)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	sizeStr, _ := taskData["size"].(string)
+	if resolution, ok := billing_setting.NormalizeVideoResolution(sizeStr); ok {
+		info.VideoResolution = resolution
+	}
+	info.PriceData.AddOtherRatio("seconds", float64(seconds))
+	info.PriceData.AddOtherRatio("size", 1)
+	// Legacy fixed-price Sora markup applied only to these two sizes.
+	// VideoResolution must not drive this ratio: 1920x1080 / 1080p are also 1080P.
+	if sizeStr == "1792x1024" || sizeStr == "1024x1792" {
+		info.PriceData.AddOtherRatio("size", 1.666667)
+	}
+	return nil
+}
+
+func remixSecondsFromTaskData(taskData map[string]any) (int, error) {
+	if taskData == nil {
+		return 0, fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+	}
+	seconds, ok := parseTaskDurationValue(taskData["seconds"])
+	if ok {
+		if seconds < 1 || seconds > relaycommon.MaxTaskDurationSeconds {
+			return 0, fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+		}
+		return seconds, nil
+	}
+	if duration, durationOK := parseTaskDurationValue(taskData["duration"]); durationOK {
+		if duration < 1 || duration > relaycommon.MaxTaskDurationSeconds {
+			return 0, fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+		}
+		return duration, nil
+	}
+	return 0, fmt.Errorf("seconds must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+}
+
+func parseTaskDurationValue(v any) (int, bool) {
+	switch n := v.(type) {
+	case string:
+		seconds, err := strconv.Atoi(strings.TrimSpace(n))
+		if err != nil {
+			return 0, false
+		}
+		return seconds, true
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			if i < math.MinInt || i > math.MaxInt {
+				return 0, false
+			}
+			return int(i), true
+		}
+		f, ferr := n.Float64()
+		if ferr != nil {
+			return 0, false
+		}
+		return parseTaskDurationValue(f)
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) {
+			return 0, false
+		}
+		if n < math.MinInt || n > math.MaxInt {
+			return 0, false
+		}
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		if n < math.MinInt || n > math.MaxInt {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
+	}
 }
 
 // RelayTaskSubmit 完成 task 提交的全部流程（每次尝试调用一次）：
@@ -179,7 +259,39 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 4. 价格计算：基础模型价格
 	info.OriginModelName = modelName
-	priceData, err := helper.ModelPriceHelperPerCall(c, info)
+	presetRatios := info.PriceData.OtherRatios()
+	originSnapshotPrice := info.PriceData.UsePrice
+	var priceData hosttypes.PriceData
+	videoPriceApplied := false
+	videoMode := info.BillingMode == billing_setting.BillingModeVideo ||
+		billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeVideo
+	var err error
+	if videoMode {
+		estimator, ok := adaptor.(channel.TaskPerCallPriceEstimator)
+		if !ok {
+			return nil, service.TaskErrorWrapperLocal(fmt.Errorf("video billing is not supported by task adaptor"), "model_price_error", http.StatusBadRequest)
+		}
+		modelPrice, estimatorErr := estimator.EstimatePerCallPrice(c, info)
+		if estimatorErr != nil {
+			return nil, estimatorErr
+		}
+		ratioMap := make(map[string]float64, len(presetRatios)+2)
+		for key, value := range presetRatios {
+			ratioMap[key] = value
+		}
+		if info.Action == constant.TaskActionRemix && !originSnapshotPrice {
+			delete(ratioMap, "size")
+		}
+		if estimatedRatios := adaptor.EstimateBilling(c, info); len(estimatedRatios) > 0 {
+			for key, value := range estimatedRatios {
+				ratioMap[key] = value
+			}
+		}
+		priceData, err = helper.ModelPriceHelperPerCallWithPrice(c, info, modelPrice, ratioMap)
+		videoPriceApplied = true
+	} else {
+		priceData, err = helper.ModelPriceHelperPerCall(c, info)
+	}
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "model_price_error", http.StatusBadRequest)
 	}
@@ -188,14 +300,19 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// 5. 计费估算：让适配器根据用户请求提供 OtherRatios（时长、分辨率等）
 	//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
 	//    ResolveOriginTask 可能已在 remix 路径中预设了 OtherRatios，此处合并。
-	if estimatedRatios := adaptor.EstimateBilling(c, info); len(estimatedRatios) > 0 {
-		for k, v := range estimatedRatios {
+	if !videoPriceApplied {
+		for k, v := range presetRatios {
 			info.PriceData.AddOtherRatio(k, v)
+		}
+		if estimatedRatios := adaptor.EstimateBilling(c, info); len(estimatedRatios) > 0 {
+			for k, v := range estimatedRatios {
+				info.PriceData.AddOtherRatio(k, v)
+			}
 		}
 	}
 
 	// 6. 将 OtherRatios 应用到基础额度（饱和转换，防止溢出成负数）
-	if !common.StringsContains(constant.TaskPricePatches, modelName) {
+	if !videoPriceApplied && !common.StringsContains(constant.TaskPricePatches, modelName) {
 		quotaWithRatios := info.PriceData.ApplyOtherRatiosToFloat(float64(info.PriceData.Quota))
 		quota, clamp := common.QuotaFromFloatChecked(quotaWithRatios)
 		info.PriceData.Quota = quota
@@ -335,7 +452,7 @@ func sunoFetchRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dto.Ta
 			return
 		}
 		for _, task := range taskModels {
-			tasks = append(tasks, TaskModel2Dto(task))
+			tasks = append(tasks, TaskModel2DtoForRequest(c, task))
 		}
 	} else {
 		tasks = make([]any, 0)
@@ -363,7 +480,7 @@ func sunoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dt
 
 	respBody, err = common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
-		Data: TaskModel2Dto(originTask),
+		Data: TaskModel2DtoForRequest(c, originTask),
 	})
 	return
 }
@@ -388,7 +505,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	isOpenAIVideoAPI := strings.HasPrefix(c.Request.RequestURI, "/v1/videos/")
 
 	// Gemini/Vertex 支持实时查询：用户 fetch 时直接从上游拉取最新状态
-	if realtimeResp := tryRealtimeFetch(originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
+	if realtimeResp := tryRealtimeFetch(c, originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
 		respBody = realtimeResp
 		return
 	}
@@ -406,7 +523,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 				taskResp = service.TaskErrorWrapper(err, "convert_to_openai_video_failed", http.StatusInternalServerError)
 				return
 			}
-			respBody = openAIVideoData
+			respBody = sanitizeUserVideoAPIResponse(c, openAIVideoData, originTask)
 			return
 		}
 		taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("not_implemented:%s", originTask.Platform), "not_implemented", http.StatusNotImplemented)
@@ -416,7 +533,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	// 通用 TaskDto 格式
 	respBody, err = common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
-		Data: TaskModel2Dto(originTask),
+		Data: TaskModel2DtoForRequest(c, originTask),
 	})
 	if err != nil {
 		taskResp = service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
@@ -427,7 +544,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 // tryRealtimeFetch 尝试从上游实时拉取 Gemini/Vertex 任务状态。
 // 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或出错时返回 nil。
 // 当非 OpenAI Video API 时，还会构建自定义格式的响应体。
-func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
+func tryRealtimeFetch(c *gin.Context, task *model.Task, isOpenAIVideoAPI bool) []byte {
 	channelModel, err := model.GetChannelById(task.ChannelId, true)
 	if err != nil {
 		return nil
@@ -481,6 +598,9 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		// No URL from adaptor — construct proxy URL using public task ID
 		task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 	}
+	if task.Status == model.TaskStatusSuccess {
+		_ = service.CacheTaskVideo(c.Request.Context(), task, channelModel)
+	}
 
 	if !snap.Equal(task.Snapshot()) {
 		_, _ = task.UpdateWithStatus(snap.Status)
@@ -499,7 +619,7 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		"metadata": nil,
 		"status":   mapTaskStatusToSimple(task.Status),
 		"task_id":  task.TaskID,
-		"url":      task.GetResultURL(),
+		"url":      publicSignedVideoContentLink(c, task),
 	}
 	respBody, _ := common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
@@ -548,6 +668,23 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 }
 
 func TaskModel2Dto(task *model.Task) *dto.TaskDto {
+	return TaskModel2DtoForRequest(nil, task)
+}
+
+func TaskModel2DtoForRequest(c *gin.Context, task *model.Task) *dto.TaskDto {
+	failReason := task.FailReason
+	if isExternalHTTPURL(failReason) || isLocalVideoContentPath(failReason) {
+		failReason = ""
+	}
+	localContent := publicSignedVideoContentLink(c, task)
+	data := task.Data
+	if task.Platform == constant.TaskPlatformSuno {
+		// Suno audio clips stay in data for the dashboard player.
+	} else if includeTaskUpstreamData(c) {
+		data = redactExternalHTTPURLs(data)
+	} else {
+		data = nil
+	}
 	return &dto.TaskDto{
 		ID:         task.ID,
 		CreatedAt:  task.CreatedAt,
@@ -560,14 +697,141 @@ func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 		Quota:      task.Quota,
 		Action:     task.Action,
 		Status:     string(task.Status),
-		FailReason: task.FailReason,
-		ResultURL:  task.GetResultURL(),
+		FailReason: failReason,
+		ResultURL:  localContent,
 		SubmitTime: task.SubmitTime,
 		StartTime:  task.StartTime,
 		FinishTime: task.FinishTime,
 		Progress:   task.Progress,
 		Properties: task.Properties,
 		Username:   task.Username,
-		Data:       task.Data,
+		Data:       data,
+	}
+}
+
+func includeTaskUpstreamData(c *gin.Context) bool {
+	return c != nil && c.GetInt("role") >= common.RoleAdminUser
+}
+
+func publicVideoContentPath(task *model.Task) string {
+	if task == nil || task.TaskID == "" || task.Status != model.TaskStatusSuccess {
+		return ""
+	}
+	if task.Platform == constant.TaskPlatformSuno {
+		return ""
+	}
+	if !isVideoTaskAction(task.Action) && strings.TrimSpace(task.GetResultURL()) == "" {
+		return ""
+	}
+	return taskcommon.BuildProxyURL(task.TaskID)
+}
+
+func publicSignedVideoContentLink(c *gin.Context, task *model.Task) string {
+	if publicVideoContentPath(task) == "" {
+		return ""
+	}
+	expires := taskcommon.VideoContentExpiry(task)
+	if c != nil {
+		return taskcommon.BuildPublicSignedProxyURL(c, task.TaskID, expires)
+	}
+	return taskcommon.BuildSignedProxyURL(task.TaskID, expires)
+}
+
+func isVideoTaskAction(action string) bool {
+	switch action {
+	case constant.TaskActionGenerate,
+		constant.TaskActionTextGenerate,
+		constant.TaskActionFirstTailGenerate,
+		constant.TaskActionReferenceGenerate,
+		constant.TaskActionRemix:
+		return true
+	default:
+		return false
+	}
+}
+
+func isExternalHTTPURL(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return false
+	}
+	if isLocalVideoContentPath(value) {
+		return false
+	}
+	return true
+}
+
+func isLocalVideoContentPath(raw string) bool {
+	return model.IsLocalVideoContentURL(raw, "")
+}
+
+func sanitizeUserVideoAPIResponse(c *gin.Context, raw []byte, task *model.Task) []byte {
+	if len(raw) == 0 || task == nil {
+		return raw
+	}
+	var top map[string]any
+	if err := common.Unmarshal(raw, &top); err != nil {
+		return raw
+	}
+	delete(top, "cost")
+	delete(top, "credits")
+	delete(top, "usage")
+	delete(top, "data")
+	top["id"] = task.TaskID
+	top["task_id"] = task.TaskID
+	redacted, _ := redactHTTPValues(top).(map[string]any)
+	if redacted == nil {
+		redacted = top
+	}
+	if task.Status == model.TaskStatusSuccess {
+		metadata, _ := redacted["metadata"].(map[string]any)
+		if metadata == nil {
+			metadata = map[string]any{}
+			redacted["metadata"] = metadata
+		}
+		metadata["url"] = publicSignedVideoContentLink(c, task)
+		redacted["expires_at"] = taskcommon.VideoContentExpiry(task)
+	}
+	out, err := common.Marshal(redacted)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func redactExternalHTTPURLs(data json.RawMessage) json.RawMessage {
+	if len(data) == 0 {
+		return data
+	}
+	var value any
+	if err := common.Unmarshal(data, &value); err != nil {
+		return data
+	}
+	redacted, err := common.Marshal(redactHTTPValues(value))
+	if err != nil {
+		return data
+	}
+	return redacted
+}
+
+func redactHTTPValues(value any) any {
+	switch typed := value.(type) {
+	case string:
+		if isExternalHTTPURL(typed) {
+			return ""
+		}
+		return typed
+	case []any:
+		for i := range typed {
+			typed[i] = redactHTTPValues(typed[i])
+		}
+		return typed
+	case map[string]any:
+		for key, item := range typed {
+			typed[key] = redactHTTPValues(item)
+		}
+		return typed
+	default:
+		return value
 	}
 }

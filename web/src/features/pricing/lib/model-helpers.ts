@@ -104,6 +104,23 @@ export function replaceModelInPath(path: string, modelName: string): string {
 /**
  * Check if model is token-based pricing
  */
-export function isTokenBasedModel(model: PricingModel): boolean {
+export function isTokenBasedModel(
+  model: Pick<PricingModel, 'quota_type'>
+): boolean {
   return model.quota_type === QUOTA_TYPE_VALUES.TOKEN
+}
+
+export function getBillingModeLabelKey(
+  model: Pick<PricingModel, 'billing_mode' | 'billing_expr' | 'quota_type'>
+): 'Per second' | 'Dynamic Pricing' | 'Token-based' | 'Per Request' {
+  if (model.billing_mode === 'video') {
+    return 'Per second'
+  }
+  if (model.billing_mode === 'tiered_expr' && Boolean(model.billing_expr)) {
+    return 'Dynamic Pricing'
+  }
+  if (isTokenBasedModel(model)) {
+    return 'Token-based'
+  }
+  return 'Per Request'
 }

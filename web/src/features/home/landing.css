@@ -1,0 +1,187 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+
+.nt-landing {
+  --nt-ink: #3a271c;
+  --nt-ink-soft: #6d5346;
+  --nt-orange: #f26b2b;
+  --nt-orange-deep: #e25716;
+  --nt-peach: #ffe4cc;
+  --nt-mint: #d7f4e8;
+  --nt-cream: #fff7ef;
+  --nt-card: rgba(255, 255, 255, 0.86);
+  --nt-line: rgba(58, 39, 28, 0.08);
+  color: var(--nt-ink);
+  background:
+    radial-gradient(ellipse 70% 45% at 12% 0%, #ffe7d0 0%, transparent 58%),
+    radial-gradient(ellipse 55% 40% at 92% 8%, #d8f6ea 0%, transparent 52%),
+    radial-gradient(ellipse 50% 35% at 70% 88%, #e7f8ef 0%, transparent 55%),
+    linear-gradient(165deg, #fff6ee 0%, #fff1e6 32%, #eef8f3 72%, #e7f5ee 100%);
+}
+
+.dark .nt-landing {
+  --nt-ink: #f6eadc;
+  --nt-ink-soft: #d7c4b4;
+  --nt-orange: #ff8a4c;
+  --nt-orange-deep: #f26b2b;
+  --nt-peach: #5a3a28;
+  --nt-mint: #244038;
+  --nt-cream: #2a1d18;
+  --nt-card: rgba(42, 29, 24, 0.78);
+  --nt-line: rgba(246, 234, 220, 0.1);
+  background:
+    radial-gradient(ellipse 70% 45% at 12% 0%, #5a3324 0%, transparent 58%),
+    radial-gradient(ellipse 55% 40% at 92% 8%, #1f3b34 0%, transparent 52%),
+    linear-gradient(165deg, #2a1c16 0%, #3a261d 40%, #1c2a26 100%);
+}
+
+.nt-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--nt-line);
+  border-radius: 9999px;
+  background: var(--nt-card);
+  box-shadow: 0 8px 24px rgba(58, 39, 28, 0.05);
+}
+
+.nt-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border-radius: 9999px;
+  background: linear-gradient(180deg, #ff8d52 0%, var(--nt-orange) 100%);
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(242, 107, 43, 0.28);
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    filter 160ms ease;
+}
+
+.nt-btn-primary:hover {
+  filter: brightness(1.03);
+  box-shadow: 0 12px 28px rgba(242, 107, 43, 0.34);
+}
+
+.nt-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  border: 1px solid color-mix(in srgb, var(--nt-ink) 12%, transparent);
+  background: color-mix(in srgb, #fff 55%, transparent);
+  color: var(--nt-ink);
+  transition: background 160ms ease;
+}
+
+.nt-btn-ghost:hover {
+  background: color-mix(in srgb, #fff 80%, transparent);
+}
+
+.nt-hero-glow {
+  background: radial-gradient(
+    circle,
+    rgba(255, 232, 204, 0.88) 0%,
+    rgba(232, 244, 234, 0.35) 46%,
+    transparent 72%
+  );
+}
+
+.nt-hero-art {
+  overflow: visible;
+  background: #f3ead8;
+  box-shadow:
+    0 22px 48px rgba(58, 39, 28, 0.12),
+    0 0 0 1px rgba(58, 39, 28, 0.06);
+}
+
+.dark .nt-hero-glow {
+  background: radial-gradient(
+    circle,
+    rgba(90, 58, 40, 0.7) 0%,
+    rgba(36, 64, 56, 0.28) 46%,
+    transparent 72%
+  );
+}
+
+.dark .nt-hero-art {
+  background: #3a2c22;
+}
+
+.nt-float-tag {
+  position: absolute;
+  z-index: 2;
+  white-space: nowrap;
+}
+
+.nt-float-tag-a {
+  top: -0.65rem;
+  right: -0.85rem;
+}
+
+.nt-float-tag-b {
+  top: 42%;
+  left: -1.1rem;
+}
+
+.nt-float-tag-c {
+  right: -0.7rem;
+  bottom: -0.55rem;
+}
+
+.nt-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 9999px;
+}
+
+.nt-dot-peach {
+  background: #f4a574;
+}
+
+.nt-dot-mint {
+  background: #6ec8a3;
+}
+
+.nt-dot-amber {
+  background: #f26b2b;
+}
+
+.nt-card {
+  border: 1px solid var(--nt-line);
+  border-radius: 1.5rem;
+  background: var(--nt-card);
+  box-shadow: 0 10px 30px rgba(58, 39, 28, 0.05);
+}
+
+@media (max-width: 767px) {
+  .nt-float-tag-a,
+  .nt-float-tag-b,
+  .nt-float-tag-c {
+    position: static;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-btn-primary {
+    transition: none;
+  }
+}

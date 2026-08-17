@@ -49,6 +49,11 @@ function SectionPageLayoutBreadcrumb(_props: SlotProps) {
 }
 SectionPageLayoutBreadcrumb.displayName = 'SectionPageLayout.Breadcrumb'
 
+function SectionPageLayoutDescription(_props: SlotProps) {
+  return null
+}
+SectionPageLayoutDescription.displayName = 'SectionPageLayout.Description'
+
 export type SectionPageLayoutProps = {
   children: ReactNode
   fixedContent?: boolean
@@ -63,17 +68,22 @@ export function SectionPageLayout(props: SectionPageLayoutProps) {
   let actions: ReactNode = null
   let content: ReactNode = null
   let breadcrumb: ReactNode = null
+  let description: ReactNode = null
 
   Children.forEach(props.children, (node) => {
     if (!isValidElement(node)) return
     const child = node as ReactElement<SlotProps>
-    if (child.type === SectionPageLayoutTitle) title = child.props.children
-    else if (child.type === SectionPageLayoutActions)
+    if (child.type === SectionPageLayoutTitle) {
+      title = child.props.children
+    } else if (child.type === SectionPageLayoutActions) {
       actions = child.props.children
-    else if (child.type === SectionPageLayoutContent)
+    } else if (child.type === SectionPageLayoutContent) {
       content = child.props.children
-    else if (child.type === SectionPageLayoutBreadcrumb)
+    } else if (child.type === SectionPageLayoutBreadcrumb) {
       breadcrumb = child.props.children
+    } else if (child.type === SectionPageLayoutDescription) {
+      description = child.props.children
+    }
   })
 
   return (
@@ -95,6 +105,14 @@ export function SectionPageLayout(props: SectionPageLayoutProps) {
               </div>
             )}
           </div>
+          {description != null && (
+            <div
+              data-slot='section-description'
+              className='mt-1.5 min-w-0 empty:hidden'
+            >
+              {description}
+            </div>
+          )}
         </div>
 
         <div
@@ -120,3 +138,4 @@ SectionPageLayout.Title = SectionPageLayoutTitle
 SectionPageLayout.Actions = SectionPageLayoutActions
 SectionPageLayout.Content = SectionPageLayoutContent
 SectionPageLayout.Breadcrumb = SectionPageLayoutBreadcrumb
+SectionPageLayout.Description = SectionPageLayoutDescription

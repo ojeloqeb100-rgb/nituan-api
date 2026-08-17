@@ -877,6 +877,14 @@ func UpdateChannelUsedQuota(id int, quota int) {
 	updateChannelUsedQuota(id, quota)
 }
 
+// ReverseChannelUsedQuota subtracts quota from channel.used_quota.
+func ReverseChannelUsedQuota(id int, quota int) {
+	if quota <= 0 {
+		return
+	}
+	UpdateChannelUsedQuota(id, -quota)
+}
+
 func updateChannelUsedQuota(id int, quota int) {
 	err := DB.Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
 	if err != nil {

@@ -32,6 +32,7 @@ export type ModelPricingSnapshotInput = {
   audioCompletionRatio: string
   billingMode: string
   billingExpr: string
+  videoPrices: string
 }
 
 export type ModelPricingSnapshot = {
@@ -47,6 +48,9 @@ export type ModelPricingSnapshot = {
   billingMode?: string
   billingExpr?: string
   requestRuleExpr?: string
+  video480Price?: string
+  video720Price?: string
+  video1080Price?: string
   hasConflict: boolean
 }
 
@@ -64,6 +68,7 @@ export const hasPricingValue = (value?: string) =>
 export const isBasePricingUnset = (snapshot?: ModelPricingSnapshot) =>
   !snapshot ||
   (snapshot.billingMode !== 'tiered_expr' &&
+    snapshot.billingMode !== 'video' &&
     !hasPricingValue(snapshot.price) &&
     !hasPricingValue(snapshot.ratio))
 
@@ -83,6 +88,7 @@ const ratioToPrice = (ratio?: string, denominator?: string) => {
 export const getModeLabel = (mode?: string) => {
   if (mode === 'per-request') return 'Per-request'
   if (mode === 'tiered_expr') return 'Expression'
+  if (mode === 'video') return 'Per second'
   return 'Per-token'
 }
 
@@ -111,6 +117,13 @@ export const getPriceSummary = (
 ) => {
   if (row.billingMode === 'tiered_expr') {
     return getExpressionSummary(row, t)
+  }
+  if (row.billingMode === 'video') {
+    return [row.video480Price, row.video720Price, row.video1080Price]
+      .filter(hasPricingValue)
+      .map((price) => `$${price}`)
+      .join(' / ')
+      .concat(' / ', t('second'))
   }
   if (row.billingMode === 'per-request') {
     return row.price ? `$${row.price} / ${t('request')}` : t('Unset price')
@@ -142,6 +155,7 @@ export const getPriceDetail = (
       ? t('Includes request rules')
       : t('Expression based')
   }
+  if (row.billingMode === 'video') return t('Video prices')
   if (row.billingMode === 'per-request') {
     return t('Fixed request price')
   }
@@ -174,6 +188,7 @@ export const buildModelSnapshots = ({
   audioCompletionRatio,
   billingMode,
   billingExpr,
+  videoPrices,
 }: ModelPricingSnapshotInput): ModelPricingSnapshot[] => {
   const priceMap = safeJsonParse<Record<string, number>>(modelPrice, {
     fallback: {},
@@ -215,6 +230,10 @@ export const buildModelSnapshots = ({
     fallback: {},
     context: 'billing expression',
   })
+  const videoPriceMap = safeJsonParse<Record<string, Record<string, number>>>(
+    videoPrices,
+    { fallback: {}, context: 'video prices' }
+  )
 
   const modelNames = new Set([
     ...Object.keys(priceMap),
@@ -227,9 +246,10 @@ export const buildModelSnapshots = ({
     ...Object.keys(audioCompletionMap),
     ...Object.keys(billingModeMap),
     ...Object.keys(billingExprMap),
+    ...Object.keys(videoPriceMap),
   ])
 
-  return Array.from(modelNames).map((name) => {
+  return [...modelNames].map((name) => {
     const price = priceMap[name]?.toString() || ''
     const ratio = ratioMap[name]?.toString() || ''
     const cache = cacheMap[name]?.toString() || ''
@@ -249,6 +269,26 @@ export const buildModelSnapshots = ({
         billingMode: 'tiered_expr',
         billingExpr: pureExpr,
         requestRuleExpr,
+        price,
+        ratio,
+        cacheRatio: cache,
+        createCacheRatio: createCache,
+        completionRatio: completion,
+        imageRatio: image,
+        audioRatio: audio,
+        audioCompletionRatio: audioCompletion,
+        hasConflict: false,
+      }
+    }
+
+    if (modeForModel === 'video') {
+      const tiers = videoPriceMap[name] || {}
+      return {
+        name,
+        billingMode: 'video',
+        video480Price: tiers['480p']?.toString() || '',
+        video720Price: tiers['720p']?.toString() || '',
+        video1080Price: tiers['1080p']?.toString() || '',
         price,
         ratio,
         cacheRatio: cache,
@@ -298,6 +338,9 @@ export const getSnapshotSignature = (snapshot?: ModelPricingSnapshot) => {
     audioCompletionRatio: snapshot.audioCompletionRatio || '',
     billingMode: snapshot.billingMode || 'per-token',
     billingExpr: snapshot.billingExpr || '',
+    video480Price: snapshot.video480Price || '',
+    video720Price: snapshot.video720Price || '',
+    video1080Price: snapshot.video1080Price || '',
     requestRuleExpr: snapshot.requestRuleExpr || '',
   })
 }

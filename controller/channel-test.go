@@ -26,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
@@ -137,6 +138,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			requestPath = "/v1/images/generations"
 		}
 
+		if shouldUseVideoChannelTest(testModel, endpointType, channel) {
+			requestPath = "/v1/videos"
+		}
+
 		// responses-only models
 		if strings.Contains(strings.ToLower(testModel), "codex") {
 			requestPath = "/v1/responses"
@@ -195,6 +200,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			relayFormat = types.RelayFormatRerank
 		case constant.EndpointTypeImageGeneration:
 			relayFormat = types.RelayFormatOpenAIImage
+		case constant.EndpointTypeOpenAIVideo:
+			relayFormat = types.RelayFormatOpenAI
 		case constant.EndpointTypeEmbeddings:
 			relayFormat = types.RelayFormatEmbedding
 		default:
@@ -365,6 +372,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	default:
 		switch req := request.(type) {
+		case *channelTestVideoRequest:
+			convertedRequest = req
 		case *dto.GeneralOpenAIRequest:
 			convertedRequest, err = adaptor.ConvertOpenAIRequest(c, info, req)
 		case *dto.ClaudeRequest:
@@ -426,6 +435,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	requestBody := bytes.NewBuffer(jsonData)
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
 	resp, err := adaptor.DoRequest(c, info, requestBody)
+	if _, ok := request.(*channelTestVideoRequest); ok {
+		return completeVideoChannelTest(c, channel, info, priceData, resp, err, tik, testUserID, testModel, endpointType)
+	}
 	if err != nil {
 		return testResult{
 			context:     c,
@@ -689,7 +701,204 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 	return message
 }
 
+const channelTestVideoSeconds = 4
+
+type channelTestVideoRequest struct {
+	Model   string `json:"model"`
+	Prompt  string `json:"prompt"`
+	Seconds any    `json:"seconds"`
+	Size    string `json:"size"`
+}
+
+func (r *channelTestVideoRequest) GetTokenCountMeta() *types.TokenCountMeta {
+	seconds := float64(channelTestVideoSeconds)
+	switch v := r.Seconds.(type) {
+	case int:
+		if v > 0 {
+			seconds = float64(v)
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			seconds = float64(n)
+		}
+	}
+	return &types.TokenCountMeta{
+		CombineText:   r.Prompt,
+		BillingRatios: map[string]float64{"seconds": seconds},
+	}
+}
+
+func (r *channelTestVideoRequest) IsStream(*http.Request) bool {
+	return false
+}
+
+func (r *channelTestVideoRequest) SetModelName(modelName string) {
+	if modelName != "" {
+		r.Model = modelName
+	}
+}
+
+func shouldUseVideoChannelTest(modelName, endpointType string, channel *model.Channel) bool {
+	if endpointType != "" {
+		return constant.EndpointType(endpointType) == constant.EndpointTypeOpenAIVideo
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeSora {
+		return true
+	}
+	return billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeVideo
+}
+
+func channelTestVideoSize(modelName string) string {
+	prices, ok := billing_setting.GetVideoPrices(modelName)
+	if !ok {
+		return billing_setting.VideoResolutionRequestSize(billing_setting.VideoResolution720P)
+	}
+	resolution, _, ok := prices.PreferredPrice(billing_setting.VideoResolution720P)
+	if !ok {
+		return billing_setting.VideoResolutionRequestSize(billing_setting.VideoResolution720P)
+	}
+	return billing_setting.VideoResolutionRequestSize(resolution)
+}
+
+func newChannelTestVideoRequest(modelName string, channel *model.Channel) *channelTestVideoRequest {
+	channelType := 0
+	if channel != nil {
+		channelType = channel.Type
+	}
+	return &channelTestVideoRequest{
+		Model:   modelName,
+		Prompt:  "a cat walking",
+		Seconds: relaycommon.FormatVideoSecondsForUpstream(channelTestVideoSeconds, channelType),
+		Size:    channelTestVideoSize(modelName),
+	}
+}
+
+// annotateLegacyNewAPIVideoSecondsError explains a 400 that only an older
+// new-api inbound parser can emit when it receives a JSON number for seconds.
+// Local outbound already sends a JSON string; this annotation is leftover
+// diagnostics if a number still reaches a transit host.
+func annotateLegacyNewAPIVideoSecondsError(err error, respBody []byte) error {
+	if err == nil || !bytes.Contains(respBody, []byte("Alias.seconds")) {
+		return err
+	}
+	return fmt.Errorf("%w; remote host rejected numeric seconds (Alias.seconds) — local outbound sends a JSON string", err)
+}
+
+func validateVideoTestResponseBody(respBody []byte) error {
+	if bodyErr := detectErrorFromTestResponseBody(respBody); bodyErr != nil {
+		return bodyErr
+	}
+	if len(bytes.TrimSpace(respBody)) == 0 {
+		return errors.New("video response body is empty")
+	}
+	id := strings.TrimSpace(gjson.GetBytes(respBody, "id").String())
+	if id == "" {
+		id = strings.TrimSpace(gjson.GetBytes(respBody, "task_id").String())
+	}
+	if id == "" {
+		return errors.New("video response is missing task id")
+	}
+	return nil
+}
+
+func completeVideoChannelTest(
+	c *gin.Context,
+	channel *model.Channel,
+	info *relaycommon.RelayInfo,
+	priceData hosttypes.PriceData,
+	resp any,
+	doErr error,
+	tik time.Time,
+	testUserID int,
+	testModel string,
+	endpointType string,
+) testResult {
+	if doErr != nil {
+		return testResult{
+			context:     c,
+			localErr:    doErr,
+			newAPIError: types.NewOpenAIError(doErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+		}
+	}
+	httpResp, _ := resp.(*http.Response)
+	if httpResp == nil {
+		err := errors.New("empty video upstream response")
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+		}
+	}
+	respBody, err := readTestResponseBody(httpResp.Body, false)
+	if err != nil {
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+		}
+	}
+	if httpResp.StatusCode != http.StatusOK && httpResp.StatusCode != http.StatusCreated {
+		err := fmt.Errorf("upstream video probe failed: status=%d body=%s", httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+		if bodyErr := detectErrorFromTestResponseBody(respBody); bodyErr != nil {
+			err = fmt.Errorf("upstream video probe failed: %w", bodyErr)
+		}
+		err = annotateLegacyNewAPIVideoSecondsError(err, respBody)
+		common.SysError(fmt.Sprintf(
+			"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
+			channel.Id,
+			channel.Name,
+			channel.Type,
+			testModel,
+			endpointType,
+			httpResp.StatusCode,
+			err,
+		))
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+		}
+	}
+	if bodyErr := validateVideoTestResponseBody(respBody); bodyErr != nil {
+		return testResult{
+			context:     c,
+			localErr:    bodyErr,
+			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+		}
+	}
+
+	usage := &dto.Usage{}
+	quota, tieredResult := settleTestQuota(info, priceData, usage)
+	tok := time.Now()
+	milliseconds := tok.Sub(tik).Milliseconds()
+	consumedTime := float64(milliseconds) / 1000.0
+	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
+	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+		ChannelId:        channel.Id,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		ModelName:        info.OriginModelName,
+		TokenName:        "模型测试",
+		Quota:            quota,
+		Content:          "模型测试",
+		UseTimeSeconds:   int(consumedTime),
+		IsStream:         info.IsStream,
+		Group:            info.UsingGroup,
+		Other:            other,
+	})
+	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	return testResult{
+		context:     c,
+		localErr:    nil,
+		newAPIError: nil,
+	}
+}
+
 func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
+	if shouldUseVideoChannelTest(model, endpointType, channel) {
+		return newChannelTestVideoRequest(model, channel)
+	}
+
 	testResponsesInput := json.RawMessage(`[{"role":"user","content":"hi"}]`)
 
 	// 根据端点类型构建不同的测试请求

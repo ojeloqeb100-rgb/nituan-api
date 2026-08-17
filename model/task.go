@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -103,7 +105,10 @@ func (m Properties) Value() (driver.Value, error) {
 type TaskPrivateData struct {
 	Key            string `json:"key,omitempty"`
 	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	ResultURL      string `json:"result_url,omitempty"`       // 上游成片 URL，仅服务端下载使用
+	LocalPath      string `json:"local_path,omitempty"`       // 本机成片路径（docker 数据卷）
+	LocalExpiresAt int64  `json:"local_expires_at,omitempty"` // 本机成片过期时间（写入成功起 12h）
+	LocalMimeType  string `json:"local_mime_type,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
 	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
@@ -120,6 +125,8 @@ type TaskBillingContext struct {
 	OtherRatios     map[string]float64 `json:"other_ratios,omitempty"`      // 附加倍率（时长、分辨率等）
 	OriginModelName string             `json:"origin_model_name,omitempty"` // 模型名称，必须为OriginModelName
 	PerCallBilling  bool               `json:"per_call_billing,omitempty"`  // 按次计费：跳过轮询阶段的差额结算
+	BillingMode     string             `json:"billing_mode,omitempty"`
+	VideoResolution string             `json:"video_resolution,omitempty"`
 }
 
 // GetUpstreamTaskID 获取上游真实 task ID（用于与 provider 通信）
@@ -131,13 +138,39 @@ func (t *Task) GetUpstreamTaskID() string {
 	return t.TaskID
 }
 
-// GetResultURL 获取任务结果 URL（视频地址等）
-// 新数据存在 PrivateData.ResultURL 中；旧数据回退到 FailReason（历史兼容）
+// GetResultURL 获取上游成片 URL，仅供服务端下载使用，不得回给普通用户。
+// 优先 PrivateData.ResultURL 中的上游直链，其次从 Data 解析，最后回退 FailReason（历史兼容）。
 func (t *Task) GetResultURL() string {
-	if t.PrivateData.ResultURL != "" {
-		return t.PrivateData.ResultURL
+	if t == nil {
+		return ""
+	}
+	if url := directExternalVideoURL(t.PrivateData.ResultURL, t.TaskID); url != "" {
+		return url
+	}
+	if url := extractVideoURLFromTaskData(t.Data, t.TaskID); url != "" {
+		return url
+	}
+	if url := directExternalVideoURL(t.FailReason, t.TaskID); url != "" {
+		return url
+	}
+	if stored := strings.TrimSpace(t.PrivateData.ResultURL); stored != "" {
+		return stored
 	}
 	return t.FailReason
+}
+
+// GetByPublicTaskId looks up a task by its public task_id without a user filter.
+func GetByPublicTaskId(taskId string) (*Task, bool, error) {
+	if taskId == "" {
+		return nil, false, nil
+	}
+	var task *Task
+	err := DB.Where("task_id = ?", taskId).First(&task).Error
+	exist, err := RecordExist(err)
+	if err != nil {
+		return nil, false, err
+	}
+	return task, exist, err
 }
 
 // GenerateTaskID 生成对外暴露的 task_xxxx 格式 ID
@@ -411,6 +444,29 @@ func (t *Task) UpdateQuota() error {
 	return DB.Model(t).Update("quota", t.Quota).Error
 }
 
+// SavePrivateData persists PrivateData only. Used after a local video write so
+// the 12h clock is stored without rewriting the rest of the task row.
+func (t *Task) SavePrivateData() error {
+	if t == nil {
+		return nil
+	}
+	return DB.Model(t).Update("private_data", t.PrivateData).Error
+}
+
+// ListRecentSuccessfulTasks returns recent successful tasks for local video backfill.
+func ListRecentSuccessfulTasks(sinceUnix int64, limit int) []*Task {
+	if limit <= 0 {
+		limit = 50
+	}
+	var tasks []*Task
+	query := DB.Where("status = ?", TaskStatusSuccess)
+	if sinceUnix > 0 {
+		query = query.Where("finish_time >= ?", sinceUnix)
+	}
+	_ = query.Order("finish_time desc").Limit(limit).Find(&tasks).Error
+	return tasks
+}
+
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Returns (true, nil) if this caller won the update, (false, nil) if
 // another process already moved the task out of fromStatus. MySQL commonly
@@ -515,6 +571,131 @@ func (t *Task) ToOpenAIVideo() *dto.OpenAIVideo {
 	openAIVideo.SetProgressStr(t.Progress)
 	openAIVideo.CreatedAt = t.CreatedAt
 	openAIVideo.CompletedAt = t.UpdatedAt
-	openAIVideo.SetMetadata("url", t.GetResultURL())
+	if t.TaskID != "" {
+		openAIVideo.SetMetadata("url", "/v1/videos/"+t.TaskID+"/content")
+	}
 	return openAIVideo
+}
+
+func directExternalVideoURL(raw string, taskID string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return ""
+	}
+	if IsLocalVideoContentURL(value, taskID) {
+		return ""
+	}
+	return value
+}
+
+func IsLocalVideoContentURL(raw string, taskID string) bool {
+	path := videoContentURLPath(raw)
+	if path == "" {
+		return false
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return strings.HasPrefix(path, "/v1/videos/") && strings.HasSuffix(path, "/content")
+	}
+	return path == "/v1/videos/"+strings.TrimSpace(taskID)+"/content"
+}
+
+func videoContentURLPath(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		parsed, err := url.Parse(value)
+		if err != nil || parsed == nil {
+			return ""
+		}
+		return parsed.Path
+	}
+	if q := strings.Index(value, "?"); q >= 0 {
+		value = value[:q]
+	}
+	return value
+}
+
+// IsSignedVideoContentURL reports whether raw already carries expires+sign.
+// Local content links and upstream CDN links can both look like this; combine
+// with IsLocalVideoContentURL to tell them apart.
+func IsSignedVideoContentURL(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed == nil {
+		return false
+	}
+	query := parsed.Query()
+	return strings.TrimSpace(query.Get("expires")) != "" && strings.TrimSpace(query.Get("sign")) != ""
+}
+
+func extractVideoURLFromTaskData(data json.RawMessage, taskID string) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var top map[string]any
+	if err := common.Unmarshal(data, &top); err != nil {
+		return ""
+	}
+	return firstVideoURLFromMap(top, taskID)
+}
+
+func firstVideoURLFromMap(root map[string]any, taskID string) string {
+	if root == nil {
+		return ""
+	}
+	if found := videoURLFromValue(root["url"], taskID); found != "" {
+		return found
+	}
+	if metadata, ok := root["metadata"].(map[string]any); ok {
+		if found := videoURLFromValue(metadata["url"], taskID); found != "" {
+			return found
+		}
+	}
+	if data, ok := root["data"].(map[string]any); ok {
+		if found := firstVideoURLFromMap(data, taskID); found != "" {
+			return found
+		}
+	}
+	if dataList, ok := root["data"].([]any); ok && len(dataList) > 0 {
+		if item, ok := dataList[0].(map[string]any); ok {
+			if found := firstVideoURLFromMap(item, taskID); found != "" {
+				return found
+			}
+		}
+	}
+	result, _ := root["result"].(map[string]any)
+	if result == nil {
+		result = root
+	}
+	videos, _ := result["videos"].([]any)
+	if len(videos) == 0 {
+		return ""
+	}
+	video, _ := videos[0].(map[string]any)
+	if video == nil {
+		return ""
+	}
+	return videoURLFromValue(video["url"], taskID)
+}
+
+func videoURLFromValue(v any, taskID string) string {
+	switch raw := v.(type) {
+	case string:
+		return directExternalVideoURL(raw, taskID)
+	case []any:
+		if len(raw) == 0 {
+			return ""
+		}
+		return videoURLFromValue(raw[0], taskID)
+	default:
+		return ""
+	}
 }

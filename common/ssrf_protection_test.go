@@ -19,6 +19,7 @@ func TestSSRFProtectionRejectsLiteralPrivateAndReservedIPs(t *testing.T) {
 		"10.0.0.1",
 		"169.254.169.254",
 		"fc00::1",
+		"fdfe:dcba:9876::4",
 		"::ffff:127.0.0.1",
 	}
 	for _, host := range tests {
@@ -48,6 +49,7 @@ func TestSSRFProtectionRejectsResolvedPrivateIP(t *testing.T) {
 
 	require.NoError(t, protection.ValidateNetworkTarget("example.com", 80))
 	require.Error(t, protection.ValidateResolvedIP("example.com", net.ParseIP("169.254.169.254")))
+	require.Error(t, protection.ValidateResolvedIP("api.migeapi.com", net.ParseIP("fdfe:dcba:9876::4")))
 }
 
 func TestNewSSRFProtectionFromFetchSettingParsesPortRanges(t *testing.T) {

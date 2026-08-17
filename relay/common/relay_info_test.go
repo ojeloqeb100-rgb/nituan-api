@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -175,4 +177,58 @@ func TestInitChannelMetaRestoresRequestReasoningEffortForRetry(t *testing.T) {
 	info.SetReasoningEffort("low")
 	info.InitChannelMeta(ctx)
 	assert.Equal(t, "max", info.ReasoningEffort)
+}
+
+func TestTaskSubmitReqUnmarshalSeconds(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    string
+		wantErr bool
+	}{
+		{name: "number 4", payload: `{"seconds":4}`, want: "4"},
+		{name: "string 4", payload: `{"seconds":"4"}`, want: "4"},
+		{name: "number", payload: `{"seconds":10}`, want: "10"},
+		{name: "string", payload: `{"seconds":"12"}`, want: "12"},
+		{name: "null", payload: `{"seconds":null}`, want: ""},
+		{name: "fraction", payload: `{"seconds":4.5}`, wantErr: true},
+		{name: "object", payload: `{"seconds":{"value":4}}`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req TaskSubmitReq
+			err := rootcommon.Unmarshal([]byte(tt.payload), &req)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.NotContains(t, err.Error(), "Alias.seconds")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, req.Seconds)
+		})
+	}
+}
+
+func TestFormatVideoSecondsForUpstream(t *testing.T) {
+	require.Equal(t, "4", FormatVideoSecondsForUpstream(4, constant.ChannelTypeOpenAI))
+	require.Equal(t, "4", FormatVideoSecondsForUpstream(4, constant.ChannelTypeSora))
+}
+
+func TestApplyVideoSecondsForUpstream(t *testing.T) {
+	t.Run("keeps string seconds for openai compatible", func(t *testing.T) {
+		body := map[string]any{"seconds": "4", "model": "m"}
+		ApplyVideoSecondsForUpstream(body, constant.ChannelTypeOpenAI)
+		require.Equal(t, "4", body["seconds"])
+	})
+	t.Run("rewrites numeric seconds to string for openai compatible", func(t *testing.T) {
+		body := map[string]any{"seconds": 4.0, "model": "m"}
+		ApplyVideoSecondsForUpstream(body, constant.ChannelTypeOpenAI)
+		require.Equal(t, "4", body["seconds"])
+	})
+	t.Run("rewrites numeric seconds to string for official sora", func(t *testing.T) {
+		body := map[string]any{"seconds": 4, "model": "m"}
+		ApplyVideoSecondsForUpstream(body, constant.ChannelTypeSora)
+		require.Equal(t, "4", body["seconds"])
+	})
 }

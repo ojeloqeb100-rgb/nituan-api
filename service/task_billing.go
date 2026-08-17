@@ -178,23 +178,30 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 	// 2. 退还令牌额度
 	taskAdjustTokenQuota(ctx, task, -quota)
 
-	// 3. 记录日志
+	// 3. 回冲消耗计数。禁止走 UpdateUserUsedQuotaAndRequestCount（它会 request_count+1）。
+	// 失败退款同时 request_count-1；quota_data count 由 RecordTaskBillingLog 回冲。
+	model.ReverseUserUsedQuotaAndRequestCount(task.UserId, quota)
+	model.ReverseChannelUsedQuota(task.ChannelId, quota)
+
+	// 4. 记录日志
 	other := taskBillingOther(task)
 	other["task_id"] = task.TaskID
 	other["reason"] = reason
+	other["refund_kind"] = model.RefundKindTaskFailure
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
-		UserId:    task.UserId,
-		LogType:   model.LogTypeRefund,
-		Content:   "",
-		ChannelId: task.ChannelId,
-		ModelName: taskModelName(task),
-		Quota:     quota,
-		TokenId:   task.PrivateData.TokenId,
-		Group:     task.Group,
-		Other:     other,
+		UserId:              task.UserId,
+		LogType:             model.LogTypeRefund,
+		Content:             "",
+		ChannelId:           task.ChannelId,
+		ModelName:           taskModelName(task),
+		Quota:               quota,
+		TokenId:             task.PrivateData.TokenId,
+		Group:               task.Group,
+		Other:               other,
+		ReverseRequestCount: true,
 	})
 
-	// 4. 资金退款完成后再清除持久化标记。
+	// 5. 资金退款完成后再清除持久化标记。
 	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
 	task.Quota = 0
 	if err := task.UpdateQuota(); err != nil {
@@ -252,11 +259,16 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	} else {
 		logType = model.LogTypeRefund
 		logQuota = -quotaDelta
+		model.ReverseUserUsedQuota(task.UserId, logQuota)
+		model.ReverseChannelUsedQuota(task.ChannelId, logQuota)
 	}
 	other := taskBillingOther(task)
 	other["task_id"] = task.TaskID
 	other["pre_consumed_quota"] = preConsumedQuota
 	other["actual_quota"] = actualQuota
+	if logType == model.LogTypeRefund {
+		other["refund_kind"] = model.RefundKindQuotaRecalculate
+	}
 	for _, clamp := range clamps {
 		attachQuotaSaturationToOther(other, clamp)
 	}

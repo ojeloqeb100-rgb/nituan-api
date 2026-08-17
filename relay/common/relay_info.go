@@ -853,6 +853,11 @@ func (info *RelayInfo) HasSendResponse() bool {
 type TaskRelayInfo struct {
 	Action       string
 	OriginTaskID string
+	// BillingMode and VideoResolution are snapshotted for asynchronous task
+	// billing so remix requests do not reinterpret an old resolution at a new
+	// absolute price.
+	BillingMode     string
+	VideoResolution string
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string
@@ -887,18 +892,34 @@ func (t *TaskSubmitReq) HasImage() bool {
 }
 
 func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
-	type Alias TaskSubmitReq
-	aux := &struct {
-		Metadata json.RawMessage `json:"metadata,omitempty"`
-		Duration json.RawMessage `json:"duration,omitempty"`
-		*Alias
-	}{
-		Alias: (*Alias)(t),
-	}
-
+	// Do not embed TaskSubmitReq/Alias here. encoding/json still writes the
+	// promoted Seconds string field and rejects JSON numbers with
+	// ".Alias.seconds of type string" even when an outer RawMessage exists.
+	aux := struct {
+		Prompt         string          `json:"prompt"`
+		Model          string          `json:"model,omitempty"`
+		Mode           string          `json:"mode,omitempty"`
+		Image          string          `json:"image,omitempty"`
+		Images         []string        `json:"images,omitempty"`
+		Size           string          `json:"size,omitempty"`
+		Duration       json.RawMessage `json:"duration,omitempty"`
+		Seconds        json.RawMessage `json:"seconds,omitempty"`
+		InputReference string          `json:"input_reference,omitempty"`
+		Metadata       json.RawMessage `json:"metadata,omitempty"`
+	}{}
 	if err := common.Unmarshal(data, &aux); err != nil {
 		return err
 	}
+	t.Prompt = aux.Prompt
+	t.Model = aux.Model
+	t.Mode = aux.Mode
+	t.Image = aux.Image
+	t.Images = aux.Images
+	t.Size = aux.Size
+	t.InputReference = aux.InputReference
+	t.Duration = 0
+	t.Seconds = ""
+	t.Metadata = nil
 
 	if len(aux.Duration) > 0 {
 		var durationInt int
@@ -911,6 +932,19 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 					t.Duration = v
 				}
 			}
+		}
+	}
+
+	if len(aux.Seconds) > 0 && string(aux.Seconds) != "null" {
+		var secondsString string
+		if err := common.Unmarshal(aux.Seconds, &secondsString); err == nil {
+			t.Seconds = secondsString
+		} else {
+			var secondsInt int
+			if err := common.Unmarshal(aux.Seconds, &secondsInt); err != nil {
+				return fmt.Errorf("seconds must be an integer or numeric string")
+			}
+			t.Seconds = strconv.Itoa(secondsInt)
 		}
 	}
 
@@ -931,6 +965,41 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// FormatVideoSecondsForUpstream returns the JSON value written to upstream
+// `seconds`. Official Sora and OpenAI-compatible transit hosts (legacy
+// new-api inbound) both unmarshal seconds as string, so outbound always
+// emits a JSON string. channelType is kept so callers can keep passing the
+// selected channel if a later host needs a different encoding.
+func FormatVideoSecondsForUpstream(seconds int, channelType int) any {
+	_ = channelType
+	return strconv.Itoa(seconds)
+}
+
+// ApplyVideoSecondsForUpstream rewrites bodyMap["seconds"] to the type the
+// upstream video API expects. Missing or unparseable values are left as-is.
+func ApplyVideoSecondsForUpstream(bodyMap map[string]any, channelType int) {
+	if bodyMap == nil {
+		return
+	}
+	raw, exists := bodyMap["seconds"]
+	if !exists || raw == nil {
+		return
+	}
+	wrapped, err := common.Marshal(map[string]any{"seconds": raw})
+	if err != nil {
+		return
+	}
+	var req TaskSubmitReq
+	if err := common.Unmarshal(wrapped, &req); err != nil {
+		return
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(req.Seconds))
+	if err != nil || seconds <= 0 {
+		return
+	}
+	bodyMap["seconds"] = FormatVideoSecondsForUpstream(seconds, channelType)
 }
 func (t *TaskSubmitReq) UnmarshalMetadata(v any) error {
 	metadata := t.Metadata

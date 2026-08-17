@@ -1353,11 +1353,58 @@ func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
 	updateUserUsedQuotaAndRequestCount(id, quota, 1)
 }
 
+// ReverseUserUsedQuota subtracts quota from user.used_quota only.
+// request_count is left unchanged — use this for price-recalculate refunds.
+// Do not call UpdateUserUsedQuotaAndRequestCount with a negative quota,
+// because that helper always increments request_count.
+func ReverseUserUsedQuota(id int, quota int) {
+	if quota <= 0 {
+		return
+	}
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, -quota)
+		return
+	}
+	updateUserUsedQuota(id, -quota)
+}
+
+// ReverseUserUsedQuotaAndRequestCount subtracts quota from used_quota and
+// decrements request_count by 1, clamped to >= 0. Use for failed-task refunds.
+// Price-recalculate refunds must keep using ReverseUserUsedQuota.
+func ReverseUserUsedQuotaAndRequestCount(id int, quota int) {
+	if quota <= 0 {
+		return
+	}
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, -quota)
+		addNewRecord(BatchUpdateTypeRequestCount, id, -1)
+		return
+	}
+	updateUserUsedQuotaAndRequestCount(id, -quota, -1)
+}
+
+func updateUserUsedQuota(id int, delta int) {
+	if delta == 0 {
+		return
+	}
+	err := DB.Model(&User{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", delta)).Error
+	if err != nil {
+		common.SysLog("failed to update user used quota: " + err.Error())
+	}
+}
+
+func requestCountAddExpr(delta int) interface{} {
+	if delta >= 0 {
+		return gorm.Expr("request_count + ?", delta)
+	}
+	return gorm.Expr("CASE WHEN request_count + ? < 0 THEN 0 ELSE request_count + ? END", delta, delta)
+}
+
 func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", count),
+			"request_count": requestCountAddExpr(count),
 		},
 	).Error
 	if err != nil {
@@ -1380,7 +1427,7 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 		map[string]interface{}{
 			"quota":         gorm.Expr("quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
-			"request_count": gorm.Expr("request_count + ?", requestCount),
+			"request_count": requestCountAddExpr(requestCount),
 		},
 	).Error
 	if err != nil {

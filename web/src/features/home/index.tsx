@@ -23,11 +23,11 @@ import { PublicLayout } from '@/components/layout'
 import { Footer } from '@/components/layout/components/footer'
 import { RichContent } from '@/components/rich-content'
 import { useTheme } from '@/context/theme-provider'
-import { isLikelyHtml } from '@/lib/content-format'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { CTA, Features, Hero, HowItWorks, Stats } from './components'
+import { LandingPage } from './components'
 import { useHomePageContent } from './hooks'
+import { resolveHomeSurface } from './lib/home-surface'
 
 export function Home() {
   const { i18n, t } = useTranslation()
@@ -36,6 +36,7 @@ export function Home() {
   const { auth } = useAuthStore()
   const isAuthenticated = !!auth.user
   const { content, isLoaded, isUrl } = useHomePageContent()
+  const surface = resolveHomeSurface({ content, isLoaded, isUrl })
 
   const syncIframePreferences = useCallback(() => {
     try {
@@ -58,7 +59,7 @@ export function Home() {
     }
   }, [isUrl, syncIframePreferences])
 
-  if (!isLoaded) {
+  if (surface === 'loading') {
     return (
       <PublicLayout showMainContainer={false}>
         <main className='flex min-h-screen items-center justify-center'>
@@ -68,8 +69,8 @@ export function Home() {
     )
   }
 
-  if (content) {
-    if (isUrl) {
+  if (surface !== 'default') {
+    if (surface === 'custom-url') {
       return (
         <PublicLayout showMainContainer={false}>
           {/*
@@ -92,9 +93,7 @@ export function Home() {
       )
     }
 
-    const contentIsHtml = isLikelyHtml(content)
-
-    if (contentIsHtml) {
+    if (surface === 'custom-html') {
       return (
         <PublicLayout showMainContainer={false}>
           <RichContent
@@ -122,11 +121,7 @@ export function Home() {
 
   return (
     <PublicLayout showMainContainer={false}>
-      <Hero isAuthenticated={isAuthenticated} />
-      <Stats />
-      <Features />
-      <HowItWorks />
-      <CTA isAuthenticated={isAuthenticated} />
+      <LandingPage isAuthenticated={isAuthenticated} />
       <Footer />
     </PublicLayout>
   )

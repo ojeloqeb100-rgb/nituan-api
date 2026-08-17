@@ -14,6 +14,8 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -355,4 +357,101 @@ func TestTestAllChannelsRejectsExistingActiveTask(t *testing.T) {
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Contains(t, recorder.Body.String(), existing.TaskID)
 	require.Contains(t, recorder.Body.String(), "已有通道测试任务正在运行或等待中")
+}
+
+func loadChannelTestVideoBilling(t *testing.T, pricesJSON string) {
+	t.Helper()
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"doubao-seedance-2.0-mini":"video"}`,
+		"billing_setting.video_prices": pricesJSON,
+	}))
+}
+
+func TestShouldUseVideoChannelTest(t *testing.T) {
+	loadChannelTestVideoBilling(t, `{"doubao-seedance-2.0-mini":{"480p":0.31,"720p":0.52}}`)
+
+	require.True(t, shouldUseVideoChannelTest("doubao-seedance-2.0-mini", "", &model.Channel{Type: constant.ChannelTypeOpenAI}))
+	require.True(t, shouldUseVideoChannelTest("gpt-4o-mini", string(constant.EndpointTypeOpenAIVideo), nil))
+	require.True(t, shouldUseVideoChannelTest("sora-2", "", &model.Channel{Type: constant.ChannelTypeSora}))
+	require.False(t, shouldUseVideoChannelTest("doubao-seedance-2.0-mini", string(constant.EndpointTypeOpenAI), &model.Channel{Type: constant.ChannelTypeOpenAI}))
+	require.False(t, shouldUseVideoChannelTest("gpt-4o-mini", "", &model.Channel{Type: constant.ChannelTypeOpenAI}))
+}
+
+func TestBuildTestRequestUsesPricedVideoTier(t *testing.T) {
+	channel := &model.Channel{Type: constant.ChannelTypeOpenAI}
+
+	t.Run("defaults to 720p when priced", func(t *testing.T) {
+		loadChannelTestVideoBilling(t, `{"doubao-seedance-2.0-mini":{"480p":0.31,"720p":0.52}}`)
+		req := buildTestRequest("doubao-seedance-2.0-mini", "", channel, false)
+		videoReq, ok := req.(*channelTestVideoRequest)
+		require.True(t, ok)
+		require.Equal(t, "4", videoReq.Seconds)
+		require.Equal(t, "720x1280", videoReq.Size)
+		payload, err := common.Marshal(videoReq)
+		require.NoError(t, err)
+		require.Contains(t, string(payload), `"seconds":"4"`)
+		require.NotContains(t, string(payload), `"seconds":4`)
+	})
+
+	t.Run("official sora probe marshals seconds as string", func(t *testing.T) {
+		sora := &model.Channel{Type: constant.ChannelTypeSora}
+		req := buildTestRequest("sora-2", "", sora, false)
+		videoReq, ok := req.(*channelTestVideoRequest)
+		require.True(t, ok)
+		require.Equal(t, "4", videoReq.Seconds)
+		payload, err := common.Marshal(videoReq)
+		require.NoError(t, err)
+		require.Contains(t, string(payload), `"seconds":"4"`)
+		require.NotContains(t, string(payload), `"seconds":4`)
+	})
+
+	t.Run("falls back to a priced tier when 720p is missing", func(t *testing.T) {
+		loadChannelTestVideoBilling(t, `{"doubao-seedance-2.0-mini":{"480p":0.31}}`)
+		req := buildTestRequest("doubao-seedance-2.0-mini", "", channel, false)
+		videoReq, ok := req.(*channelTestVideoRequest)
+		require.True(t, ok)
+		require.Equal(t, "854x480", videoReq.Size)
+	})
+
+	t.Run("keeps chat when openai endpoint is explicit", func(t *testing.T) {
+		loadChannelTestVideoBilling(t, `{"doubao-seedance-2.0-mini":{"480p":0.31,"720p":0.52}}`)
+		req := buildTestRequest("doubao-seedance-2.0-mini", string(constant.EndpointTypeOpenAI), channel, false)
+		_, ok := req.(*dto.GeneralOpenAIRequest)
+		require.True(t, ok)
+	})
+}
+
+func TestValidateVideoTestResponseBody(t *testing.T) {
+	require.NoError(t, validateVideoTestResponseBody([]byte(`{"id":"video_123","status":"queued"}`)))
+	require.NoError(t, validateVideoTestResponseBody([]byte(`{"task_id":"task_123","status":"submitted"}`)))
+	require.Error(t, validateVideoTestResponseBody([]byte(`{}`)))
+	require.Error(t, validateVideoTestResponseBody([]byte(`{"error":{"message":"model does not support chat"}}`)))
+}
+
+func TestAnnotateLegacyNewAPIVideoSecondsError(t *testing.T) {
+	legacyBody := []byte(`{"code":"invalid_json","message":"json: cannot unmarshal number into Go struct field .Alias.seconds of type string","data":null}`)
+	base := fmt.Errorf("upstream video probe failed: status=400 body=%s", legacyBody)
+
+	annotated := annotateLegacyNewAPIVideoSecondsError(base, legacyBody)
+	require.Error(t, annotated)
+	require.ErrorIs(t, annotated, base)
+	require.Contains(t, annotated.Error(), "JSON string")
+	require.Contains(t, annotated.Error(), "Alias.seconds")
+
+	require.Equal(t, base, annotateLegacyNewAPIVideoSecondsError(base, []byte(`{"code":"invalid_seconds"}`)))
+	require.NoError(t, annotateLegacyNewAPIVideoSecondsError(nil, legacyBody))
+}
+
+func TestChannelTestVideoSizePrefersConfiguredTier(t *testing.T) {
+	loadChannelTestVideoBilling(t, `{"doubao-seedance-2.0-mini":{"1080p":1.2}}`)
+	require.Equal(t, "1920x1080", channelTestVideoSize("doubao-seedance-2.0-mini"))
+	require.Equal(t, billing_setting.VideoResolutionRequestSize(billing_setting.VideoResolution720P), channelTestVideoSize("unknown-model"))
 }

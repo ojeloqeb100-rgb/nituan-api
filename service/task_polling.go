@@ -549,6 +549,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			// No URL from adaptor — construct proxy URL using public task ID
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		}
+		if cacheErr := CacheTaskVideo(ctx, task, ch); cacheErr != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("local video cache deferred for task %s", task.TaskID))
+		}
 		shouldSettle = true
 	case model.TaskStatusFailure:
 		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -271,4 +272,134 @@ func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T)
 	require.Equal(t, "QuotaFromFloat", clamp.Op)
 	require.Equal(t, common.QuotaClampOverflow, clamp.Kind)
 	require.Nil(t, info.Billing)
+}
+
+func TestModelPriceHelperPerCallWithPriceConvertsQuotaOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedQuotaPerUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 500000
+	t.Cleanup(func() { common.QuotaPerUnit = savedQuotaPerUnit })
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "video-model",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+	}
+
+	priceData, err := ModelPriceHelperPerCallWithPrice(
+		ctx,
+		info,
+		0.000001,
+		map[string]float64{"seconds": 10},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 5, priceData.Quota)
+	require.Equal(t, 10.0, priceData.OtherRatios()["seconds"])
+}
+
+func TestHasModelBillingConfigRecognizesConfiguredModes(t *testing.T) {
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	savedModelPrices := ratio_setting.ModelPrice2JSONString()
+	savedModelRatios := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedModelPrices))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedModelRatios))
+	})
+	originalSelfUse := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = false
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = originalSelfUse })
+
+	modelPrices, err := common.Marshal(map[string]float64{"per-call-model": 0.04})
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(modelPrices)))
+	modelRatios, err := common.Marshal(map[string]float64{"token-model": 15})
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(modelRatios)))
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"video-visible-model":"video","video-unpriced-model":"video","tiered-model":"tiered_expr","tiered-empty-model":"tiered_expr"}`,
+		"billing_setting.video_prices": `{"video-visible-model":{"480p":0.31,"720p":0.52}}`,
+		"billing_setting.billing_expr": `{"tiered-model":"tier(\"base\", p * 2)","tiered-empty-model":"   "}`,
+	}))
+
+	require.True(t, HasModelBillingConfig("video-visible-model"))
+	require.False(t, HasModelBillingConfig("video-unpriced-model"))
+	require.True(t, HasModelBillingConfig("per-call-model"))
+	require.True(t, HasModelBillingConfig("token-model"))
+	require.True(t, HasModelBillingConfig("tiered-model"))
+	require.False(t, HasModelBillingConfig("tiered-empty-model"))
+	require.False(t, HasModelBillingConfig("unknown-model"))
+}
+
+func TestModelPriceHelperRecognizesVideoPrices(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	originalSelfUse := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = false
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = originalSelfUse })
+	savedQuotaPerUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 500000
+	t.Cleanup(func() { common.QuotaPerUnit = savedQuotaPerUnit })
+
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"video-priced-model":"video","video-480p-only":"video","video-unpriced-model":"video"}`,
+		"billing_setting.video_prices": `{"video-priced-model":{"480p":0.31,"720p":0.52},"video-480p-only":{"480p":0.31}}`,
+	}))
+
+	newInfo := func(modelName string) (*gin.Context, *relaycommon.RelayInfo) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Set("group", "default")
+		return ctx, &relaycommon.RelayInfo{
+			OriginModelName: modelName,
+			UserGroup:       "default",
+			UsingGroup:      "default",
+		}
+	}
+
+	ctx, info := newInfo("video-priced-model")
+	priceData, err := ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{
+		BillingRatios: map[string]float64{"seconds": 4},
+	})
+	require.NoError(t, err)
+	require.True(t, priceData.UsePrice)
+	require.Equal(t, 0.52, priceData.ModelPrice)
+	require.Equal(t, 4.0, priceData.OtherRatios()["seconds"])
+	require.Equal(t, 1040000, priceData.Quota)
+	require.Equal(t, 1040000, priceData.QuotaToPreConsume)
+
+	ctx, info = newInfo("video-480p-only")
+	priceData, err = ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	require.True(t, priceData.UsePrice)
+	require.Equal(t, 0.31, priceData.ModelPrice)
+	require.Equal(t, 1.0, priceData.OtherRatios()["seconds"])
+	require.Equal(t, 155000, priceData.Quota)
+
+	ctx, info = newInfo("video-unpriced-model")
+	_, err = ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "video-unpriced-model")
+	require.Regexp(t, "价格未配置|价格尚未由管理员配置|price not configured|has not been priced", err.Error())
+
+	ctx, info = newInfo("video-priced-model")
+	_, err = ModelPriceHelper(ctx, info, 0, &types.TokenCountMeta{
+		BillingRatios: map[string]float64{"seconds": 3601},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "seconds must be between 1 and 3600")
 }

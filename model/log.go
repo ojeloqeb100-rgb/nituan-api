@@ -92,6 +92,12 @@ const (
 	LogTypeLogin   = 7
 )
 
+// refund_kind values stored on type=6 task billing logs (other.refund_kind).
+const (
+	RefundKindTaskFailure      = "task_failure"
+	RefundKindQuotaRecalculate = "quota_recalculate"
+)
+
 func ensureLogRequestId(log *Log) {
 	if log != nil && log.RequestId == "" {
 		log.RequestId = common.NewRequestId()
@@ -414,6 +420,9 @@ type RecordTaskBillingLogParams struct {
 	Group     string
 	Other     map[string]interface{}
 	NodeName  string // 任务发起节点；为空时回退当前节点
+	// ReverseRequestCount decrements quota_data.count by 1 on refunds.
+	// Failure refunds set this; price-recalculate refunds leave it false.
+	ReverseRequestCount bool
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
@@ -446,21 +455,34 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	if err != nil {
 		common.SysLog("failed to record task billing log: " + err.Error())
 	}
-	if params.LogType == LogTypeConsume && common.DataExportEnabled {
+	if common.DataExportEnabled && (params.LogType == LogTypeConsume || params.LogType == LogTypeRefund) {
 		nodeName := params.NodeName
 		if nodeName == "" {
 			nodeName = common.NodeName
+		}
+		quota := params.Quota
+		var count *int
+		if params.LogType == LogTypeRefund {
+			quota = -params.Quota
+			if params.ReverseRequestCount {
+				minusOne := -1
+				count = &minusOne
+			} else {
+				zero := 0
+				count = &zero
+			}
 		}
 		LogQuotaData(QuotaDataLogParams{
 			UserID:    params.UserId,
 			Username:  username,
 			ModelName: params.ModelName,
-			Quota:     params.Quota,
+			Quota:     quota,
 			CreatedAt: createdAt,
 			UseGroup:  params.Group,
 			TokenID:   params.TokenId,
 			ChannelID: params.ChannelId,
 			NodeName:  nodeName,
+			Count:     count,
 		})
 	}
 }
@@ -616,7 +638,12 @@ type Stat struct {
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
+	// Net usage = consume quota − refund quota. Refund logs stay type=6 with a
+	// positive quota column; do not write negative type=2 rows or type=1 top-ups.
+	tx := LOG_DB.Table("logs").Select(fmt.Sprintf(
+		"COALESCE(SUM(CASE WHEN type = %d THEN quota ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN type = %d THEN quota ELSE 0 END), 0) AS quota",
+		LogTypeConsume, LogTypeRefund,
+	))
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
@@ -652,7 +679,6 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		rpmTpmQuery = rpmTpmQuery.Where(logGroupCol+" = ?", group)
 	}
 
-	tx = tx.Where("type = ?", LogTypeConsume)
 	rpmTpmQuery = rpmTpmQuery.Where("type = ?", LogTypeConsume)
 
 	// 只统计最近60秒的rpm和tpm

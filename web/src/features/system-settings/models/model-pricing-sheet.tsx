@@ -74,6 +74,8 @@ import {
   numericDraftRegex,
   ratioFieldByLane,
   toNumberOrNull,
+  validateVideoTierPrices,
+  VIDEO_TIER_EMPTY_HINT,
   type LaneKey,
   type ModelPricingFormValues,
   type ModelRatioData,
@@ -170,6 +172,9 @@ export const ModelPricingEditorPanel = forwardRef<
       imageRatio: '',
       audioRatio: '',
       audioCompletionRatio: '',
+      video480Price: '',
+      video720Price: '',
+      video1080Price: '',
     },
   })
 
@@ -187,14 +192,19 @@ export const ModelPricingEditorPanel = forwardRef<
         imageRatio: editData.imageRatio || '',
         audioRatio: editData.audioRatio || '',
         audioCompletionRatio: editData.audioCompletionRatio || '',
+        video480Price: editData.video480Price || '',
+        video720Price: editData.video720Price || '',
+        video1080Price: editData.video1080Price || '',
       })
-      setPricingMode(
-        editData.billingMode === 'tiered_expr'
-          ? 'tiered_expr'
-          : editData.price
-            ? 'per-request'
-            : 'per-token'
-      )
+      let nextPricingMode: PricingMode = 'per-token'
+      if (editData.billingMode === 'tiered_expr') {
+        nextPricingMode = 'tiered_expr'
+      } else if (editData.billingMode === 'video') {
+        nextPricingMode = 'video'
+      } else if (editData.price) {
+        nextPricingMode = 'per-request'
+      }
+      setPricingMode(nextPricingMode)
       setBillingExpr(editData.billingExpr || '')
       setRequestRuleExpr(editData.requestRuleExpr || '')
     } else {
@@ -208,6 +218,9 @@ export const ModelPricingEditorPanel = forwardRef<
         imageRatio: '',
         audioRatio: '',
         audioCompletionRatio: '',
+        video480Price: '',
+        video720Price: '',
+        video1080Price: '',
       })
       setPricingMode('per-token')
       setBillingExpr('')
@@ -407,8 +420,29 @@ export const ModelPricingEditorPanel = forwardRef<
       nextWarnings.push(t('Audio output price requires an audio input price.'))
     }
 
+    if (pricingMode === 'video') {
+      const videoValidation = validateVideoTierPrices({
+        video480Price: watchedValues.video480Price,
+        video720Price: watchedValues.video720Price,
+        video1080Price: watchedValues.video1080Price,
+      })
+      if (!videoValidation.ok) {
+        nextWarnings.push(t(videoValidation.message))
+      }
+    }
+
     return nextWarnings
-  }, [editData, laneEnabled, lanePrices, pricingMode, promptPrice, t])
+  }, [
+    editData,
+    laneEnabled,
+    lanePrices,
+    pricingMode,
+    promptPrice,
+    t,
+    watchedValues.video480Price,
+    watchedValues.video720Price,
+    watchedValues.video1080Price,
+  ])
 
   const validatePricingValues = useCallback(() => {
     if (
@@ -435,6 +469,20 @@ export const ModelPricingEditorPanel = forwardRef<
       return false
     }
 
+    if (pricingMode === 'video') {
+      const videoValidation = validateVideoTierPrices({
+        video480Price: form.getValues('video480Price'),
+        video720Price: form.getValues('video720Price'),
+        video1080Price: form.getValues('video1080Price'),
+      })
+      if (!videoValidation.ok) {
+        form.setError('video480Price', {
+          message: t(videoValidation.message),
+        })
+        return false
+      }
+    }
+
     return true
   }, [form, laneEnabled, lanePrices, pricingMode, promptPrice, t])
 
@@ -451,6 +499,9 @@ export const ModelPricingEditorPanel = forwardRef<
         imageRatio: values.imageRatio || '',
         audioRatio: values.audioRatio || '',
         audioCompletionRatio: values.audioCompletionRatio || '',
+        video480Price: values.video480Price || '',
+        video720Price: values.video720Price || '',
+        video1080Price: values.video1080Price || '',
       }
 
       if (pricingMode === 'tiered_expr') {
@@ -544,7 +595,7 @@ export const ModelPricingEditorPanel = forwardRef<
                   onValueChange={handleModeChange}
                   className='gap-4'
                 >
-                  <TabsList className='grid w-full grid-cols-3'>
+                  <TabsList className='grid w-full grid-cols-4'>
                     <TabsTrigger value='per-token'>
                       {t('Per-token')}
                     </TabsTrigger>
@@ -554,6 +605,7 @@ export const ModelPricingEditorPanel = forwardRef<
                     <TabsTrigger value='tiered_expr'>
                       {t('Expression')}
                     </TabsTrigger>
+                    <TabsTrigger value='video'>{t('Per second')}</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value='per-token' className='pt-0'>
@@ -649,6 +701,67 @@ export const ModelPricingEditorPanel = forwardRef<
                         onBillingExprChange={setBillingExpr}
                         onRequestRuleExprChange={setRequestRuleExpr}
                       />
+                    </FieldGroup>
+                  </TabsContent>
+
+                  <TabsContent value='video' className='pt-0'>
+                    <FieldGroup className='gap-5'>
+                      <FieldDescription>
+                        {t(
+                          'Set the USD price for each generated video second by resolution.'
+                        )}{' '}
+                        {t(VIDEO_TIER_EMPTY_HINT)}
+                      </FieldDescription>
+                      <div className='grid gap-4 sm:grid-cols-3'>
+                        {[
+                          {
+                            name: 'video480Price' as const,
+                            label: '480P price',
+                            placeholder: '',
+                          },
+                          {
+                            name: 'video720Price' as const,
+                            label: '720P price',
+                            placeholder: '',
+                          },
+                          {
+                            name: 'video1080Price' as const,
+                            label: '1080P price',
+                            placeholder: '',
+                          },
+                        ].map((fieldConfig) => (
+                          <FormField
+                            key={fieldConfig.name}
+                            control={form.control}
+                            name={fieldConfig.name}
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>{t(fieldConfig.label)}</FormLabel>
+                                <FormControl>
+                                  <InputGroup>
+                                    <InputGroupAddon>$</InputGroupAddon>
+                                    <InputGroupInput
+                                      inputMode='decimal'
+                                      placeholder={fieldConfig.placeholder}
+                                      {...field}
+                                      onChange={(event) => {
+                                        const value = event.target.value
+                                        if (numericDraftRegex.test(value)) {
+                                          field.onChange(value)
+                                        }
+                                      }}
+                                    />
+                                    <InputGroupAddon align='inline-end'>
+                                      {t('per second')}
+                                    </InputGroupAddon>
+                                  </InputGroup>
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        ))}
+                      </div>
                     </FieldGroup>
                   </TabsContent>
                 </Tabs>

@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -17,7 +18,7 @@ export default defineConfig(({ envMode }) => {
 
   const isProd = envMode === 'production'
   const devProxy = Object.fromEntries(
-    (['/api', '/mj', '/pg'] as const).map((key) => [
+    (['/api', '/mj', '/pg', '/v1'] as const).map((key) => [
       key,
       { target: serverUrl, changeOrigin: true },
     ])
@@ -88,6 +89,18 @@ export default defineConfig(({ envMode }) => {
     },
     tools: {
       rspack: {
+        // Docker Desktop on Windows does not deliver inotify for bind mounts.
+        // Without polling, `bun run dev` keeps serving the compile from container
+        // start and later host edits never appear at localhost:5173.
+        ...(existsSync('/.dockerenv')
+          ? {
+              watchOptions: {
+                poll: 1000,
+                aggregateTimeout: 300,
+                ignored: /node_modules/,
+              },
+            }
+          : {}),
         plugins: [
           tanstackRouter({
             target: 'react',

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -38,6 +40,7 @@ func TestMain(m *testing.M) {
 	common.RedisEnabled = false
 	common.BatchUpdateEnabled = false
 	common.LogConsumeEnabled = true
+	common.DataExportEnabled = true
 
 	if err := db.AutoMigrate(
 		&model.Task{},
@@ -45,6 +48,7 @@ func TestMain(m *testing.M) {
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
+		&model.QuotaData{},
 		&model.TopUp{},
 		&model.UserSubscription{},
 		&model.SystemTask{},
@@ -60,18 +64,27 @@ func TestMain(m *testing.M) {
 // Seed helpers
 // ---------------------------------------------------------------------------
 
+func resetQuotaDataCache() {
+	model.CacheQuotaDataLock.Lock()
+	model.CacheQuotaData = make(map[string]*model.QuotaData)
+	model.CacheQuotaDataLock.Unlock()
+}
+
 func truncate(t *testing.T) {
 	t.Helper()
+	resetQuotaDataCache()
 	t.Cleanup(func() {
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
 		model.DB.Exec("DELETE FROM tokens")
 		model.DB.Exec("DELETE FROM logs")
 		model.DB.Exec("DELETE FROM channels")
+		model.DB.Exec("DELETE FROM quota_data")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		resetQuotaDataCache()
 	})
 }
 
@@ -249,6 +262,65 @@ func getUserQuota(t *testing.T, id int) int {
 	return user.Quota
 }
 
+func getUserUsedQuota(t *testing.T, id int) int {
+	t.Helper()
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", id).First(&user).Error)
+	return user.UsedQuota
+}
+
+func getUserRequestCount(t *testing.T, id int) int {
+	t.Helper()
+	var user model.User
+	require.NoError(t, model.DB.Select("request_count").Where("id = ?", id).First(&user).Error)
+	return user.RequestCount
+}
+
+func getChannelUsedQuota(t *testing.T, id int) int64 {
+	t.Helper()
+	var ch model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", id).First(&ch).Error)
+	return ch.UsedQuota
+}
+
+func setUserUsage(t *testing.T, id int, usedQuota int, requestCount int) {
+	t.Helper()
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"used_quota":    usedQuota,
+		"request_count": requestCount,
+	}).Error)
+}
+
+func setChannelUsedQuota(t *testing.T, id int, usedQuota int) {
+	t.Helper()
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", id).Update("used_quota", usedQuota).Error)
+}
+
+func sumQuotaDataQuota(t *testing.T) int {
+	t.Helper()
+	model.SaveQuotaDataCache()
+	var total int
+	require.NoError(t, model.DB.Table("quota_data").Select("COALESCE(SUM(quota), 0)").Scan(&total).Error)
+	return total
+}
+
+func sumQuotaDataCount(t *testing.T) int {
+	t.Helper()
+	model.SaveQuotaDataCache()
+	var total int
+	require.NoError(t, model.DB.Table("quota_data").Select("COALESCE(SUM(count), 0)").Scan(&total).Error)
+	return total
+}
+
+func newTaskGinContext(username string) *gin.Context {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("username", username)
+	c.Set("token_name", "test_token")
+	return c
+}
+
 func getTokenRemainQuota(t *testing.T, id int) int {
 	t.Helper()
 	var token model.Token
@@ -420,6 +492,84 @@ func TestRefundTaskQuota_FundingFailureKeepsPendingMarker(t *testing.T) {
 	assert.Equal(t, preConsumed, task.Quota)
 	assert.Equal(t, preConsumed, getTaskQuota(t, task.ID))
 	assert.Equal(t, int64(0), countLogs(t))
+	assert.Equal(t, 0, getUserUsedQuota(t, userID))
+}
+
+func TestRefundTaskQuota_ReversesUsedQuotaAndQuotaData(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 40, 40, 40
+	const initQuota, preConsumed = 10000, 2080
+	const tokenRemain = 5000
+
+	seedUser(t, userID, initQuota)
+	seedToken(t, tokenID, userID, "sk-refund-used", tokenRemain)
+	seedChannel(t, channelID)
+
+	ginCtx := newTaskGinContext("test_user")
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		OriginModelName: "test-model",
+		UsingGroup:      "default",
+		PriceData: types.PriceData{
+			Quota:      preConsumed,
+			ModelPrice: 0.02,
+			GroupRatioInfo: types.GroupRatioInfo{
+				GroupRatio: 1.0,
+			},
+		},
+		ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: channelID},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "generate"},
+	}
+	LogTaskConsumption(ginCtx, info)
+
+	require.Equal(t, preConsumed, getUserUsedQuota(t, userID))
+	require.Equal(t, 1, getUserRequestCount(t, userID))
+	require.Equal(t, int64(preConsumed), getChannelUsedQuota(t, channelID))
+	require.Equal(t, preConsumed, sumQuotaDataQuota(t))
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	assert.True(t, RefundTaskQuota(ctx, task, "task failed: upstream error"))
+
+	assert.Equal(t, initQuota+preConsumed, getUserQuota(t, userID))
+	assert.Equal(t, 0, getUserUsedQuota(t, userID))
+	assert.Equal(t, 0, getUserRequestCount(t, userID))
+	assert.Equal(t, int64(0), getChannelUsedQuota(t, channelID))
+	assert.Equal(t, 0, sumQuotaDataQuota(t))
+	assert.Equal(t, 0, sumQuotaDataCount(t))
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, model.LogTypeRefund, log.Type)
+	assert.Equal(t, preConsumed, log.Quota)
+	assert.Greater(t, log.Quota, 0)
+	var other map[string]interface{}
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	assert.Equal(t, model.RefundKindTaskFailure, other["refund_kind"])
+}
+
+func TestRefundTaskQuota_RequestCountNotBelowZero(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, channelID = 41, 41
+	const initQuota, preConsumed = 8000, 500
+
+	seedUser(t, userID, initQuota)
+	setUserUsage(t, userID, preConsumed, 0)
+	seedChannel(t, channelID)
+	setChannelUsedQuota(t, channelID, preConsumed)
+
+	task := makeTask(userID, channelID, preConsumed, 0, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	assert.True(t, RefundTaskQuota(ctx, task, "already-zero request count"))
+	assert.Equal(t, 0, getUserUsedQuota(t, userID))
+	assert.Equal(t, 0, getUserRequestCount(t, userID))
 }
 
 // ===========================================================================
@@ -469,8 +619,10 @@ func TestRecalculate_NegativeDelta(t *testing.T) {
 	const tokenRemain = 5000
 
 	seedUser(t, userID, initQuota)
+	setUserUsage(t, userID, preConsumed, 1)
 	seedToken(t, tokenID, userID, "sk-recalc-neg", tokenRemain)
 	seedChannel(t, channelID)
+	setChannelUsedQuota(t, channelID, preConsumed)
 
 	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
 
@@ -482,6 +634,11 @@ func TestRecalculate_NegativeDelta(t *testing.T) {
 	// Token should be refunded the difference
 	assert.Equal(t, tokenRemain+(preConsumed-actualQuota), getTokenRemainQuota(t, tokenID))
 
+	// UsedQuota / channel used_quota reverse the over-charge; request_count stays
+	assert.Equal(t, actualQuota, getUserUsedQuota(t, userID))
+	assert.Equal(t, 1, getUserRequestCount(t, userID))
+	assert.Equal(t, int64(actualQuota), getChannelUsedQuota(t, channelID))
+
 	// task.Quota updated
 	assert.Equal(t, actualQuota, task.Quota)
 
@@ -490,6 +647,51 @@ func TestRecalculate_NegativeDelta(t *testing.T) {
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
 	assert.Equal(t, preConsumed-actualQuota, log.Quota)
+	var other map[string]interface{}
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	assert.Equal(t, model.RefundKindQuotaRecalculate, other["refund_kind"])
+}
+
+func TestRecalculate_NegativeDelta_KeepsRequestCountAndQuotaDataCount(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 15, 15, 15
+	const initQuota, preConsumed = 10000, 5000
+	const actualQuota = 3000
+	const tokenRemain = 5000
+
+	seedUser(t, userID, initQuota)
+	seedToken(t, tokenID, userID, "sk-recalc-count", tokenRemain)
+	seedChannel(t, channelID)
+
+	ginCtx := newTaskGinContext("test_user")
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		TokenId:         tokenID,
+		OriginModelName: "test-model",
+		UsingGroup:      "default",
+		PriceData: types.PriceData{
+			Quota:      preConsumed,
+			ModelPrice: 0.02,
+			GroupRatioInfo: types.GroupRatioInfo{
+				GroupRatio: 1.0,
+			},
+		},
+		ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: channelID},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "generate"},
+	}
+	LogTaskConsumption(ginCtx, info)
+	require.Equal(t, 1, getUserRequestCount(t, userID))
+	require.Equal(t, 1, sumQuotaDataCount(t))
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	RecalculateTaskQuota(ctx, task, actualQuota, "adaptor adjustment")
+
+	assert.Equal(t, actualQuota, getUserUsedQuota(t, userID))
+	assert.Equal(t, 1, getUserRequestCount(t, userID))
+	assert.Equal(t, 1, sumQuotaDataCount(t))
+	assert.Equal(t, actualQuota, sumQuotaDataQuota(t))
 }
 
 func TestRecalculate_ZeroDelta(t *testing.T) {

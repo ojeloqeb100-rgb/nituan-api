@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -243,11 +245,51 @@ func WssAuth(c *gin.Context) {
 
 }
 
+// videoAccessCookieName is a short-lived, path-scoped cookie the dashboard
+// sets so a top-level navigation to /v1/videos/{id}/content can authenticate
+// without an Authorization header (plain <a target=_blank> clicks).
+const videoAccessCookieName = "new_api_video_access"
+const videoContentSignedContextKey = "video_content_signed"
+
+// VideoContentAccess accepts a 12h signed query (expires+sign) so a copied
+// result_url can be opened in a new tab without Authorization. Invalid
+// signatures are rejected; expired-but-valid signatures reach the handler
+// so it can return 410. Requests without a signature still use TokenOrUserAuth.
+func VideoContentAccess() func(c *gin.Context) {
+	return func(c *gin.Context) {
+		expires := strings.TrimSpace(c.Query("expires"))
+		sign := strings.TrimSpace(c.Query("sign"))
+		if expires != "" || sign != "" {
+			if taskcommon.VerifyVideoContentSign(c.Param("task_id"), expires, sign) {
+				c.Set(videoContentSignedContextKey, true)
+				c.Next()
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": gin.H{
+					"message": "Invalid video link signature",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+		TokenOrUserAuth()(c)
+	}
+}
+
 // TokenOrUserAuth allows either session-based user auth or API token auth.
 // Used for endpoints that need to be accessible from both the dashboard and API clients.
 func TokenOrUserAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		raw, ok := authorizationToken(c.GetHeader("Authorization"))
+		if !ok {
+			if cookie, err := c.Cookie(videoAccessCookieName); err == nil {
+				if decoded, decodeErr := url.QueryUnescape(cookie); decodeErr == nil {
+					cookie = decoded
+				}
+				raw, ok = authorizationToken(cookie)
+			}
+		}
 		if ok {
 			identity, internal, err := service.ParseDashboardAccessToken(raw)
 			if !internal {
